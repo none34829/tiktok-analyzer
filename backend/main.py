@@ -131,7 +131,7 @@ def analyze_user_content(user, query):
         }}
         """
         
-        response = openai_client.chat.completions.create(
+        response = openai.chat.completions.create(
             model="gpt-4",
             response_format={"type": "json_object"},
             messages=[
@@ -157,7 +157,7 @@ def analyze_user_content(user, query):
 def analyze_profile_picture(base64_image, query):
     """Analyze the profile picture using OpenAI Vision API"""
     try:
-        response = openai_client.chat.completions.create(
+        response = openai.chat.completions.create(
             model="gpt-4-vision-preview",
             messages=[
                 {
