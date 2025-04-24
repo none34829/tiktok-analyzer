@@ -111,7 +111,9 @@ interface ApiErrorResponse {
 }
 
 // API URL
-const API_BASE_URL = "http://localhost:8000";
+const API_BASE_URL = typeof window !== 'undefined' && window.location.hostname === 'localhost' 
+  ? "http://localhost:8000"
+  : "https://tiktok-analyzer-production.up.railway.app";
 
 // Add this interface where appropriate in your file, possibly near other interfaces
 interface DownloadAddr {
