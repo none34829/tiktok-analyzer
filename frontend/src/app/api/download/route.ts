@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import axios from 'axios';
 
-// API base URL from environment variable or default to localhost
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+// API base URL from environment variable or default to production URL
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://tiktok-analyzer-production.up.railway.app';
 
 export async function GET(request: NextRequest) {
   try {
