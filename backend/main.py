@@ -19,7 +19,7 @@ app = FastAPI(title="TikTok Analyzer")
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your frontend domain
+    allow_origins=["https://tiktok-analyzer-2.vercel.app", "*"],  # In production, specify your frontend domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

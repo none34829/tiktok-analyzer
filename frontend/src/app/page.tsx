@@ -112,10 +112,7 @@ interface ApiErrorResponse {
 
 // API URL
 // API URL - Explicitly check for the production domain
-const API_BASE_URL = typeof window !== 'undefined' && 
-  (window.location.hostname.includes('vercel.app') || window.location.hostname.includes('tiktok-analyzer-2'))
-  ? "https://tiktok-analyzer-production.up.railway.app"
-  : "http://localhost:8000";
+const API_BASE_URL = "https://tiktok-analyzer-production.up.railway.app";
 
 // Add this interface where appropriate in your file, possibly near other interfaces
 interface DownloadAddr {
