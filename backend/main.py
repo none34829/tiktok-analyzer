@@ -30,7 +30,10 @@ RAPID_API_KEY = os.getenv("RAPID_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Configure OpenAI client
-openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+openai_client = openai.OpenAI(
+    api_key=OPENAI_API_KEY,
+    base_url="https://api.openai.com/v1"
+)
 
 # ScrapTik API base URL
 BASE_URL = "https://scraptik.p.rapidapi.com"
