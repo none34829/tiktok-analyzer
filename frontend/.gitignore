@@ -42,5 +42,3 @@ next-env.d.ts
 
 # Add backend/.env to .gitignore
 
-
-.vercel

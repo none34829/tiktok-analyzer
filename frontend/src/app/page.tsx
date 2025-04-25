@@ -111,8 +111,7 @@ interface ApiErrorResponse {
 }
 
 // API URL
-// API URL - Explicitly check for the production domain
-const API_BASE_URL = "https://tiktok-analyzer-production.up.railway.app";
+const API_BASE_URL = "http://localhost:8000";
 
 // Add this interface where appropriate in your file, possibly near other interfaces
 interface DownloadAddr {
@@ -135,13 +134,26 @@ interface AnalysisResponse {
   error?: string;
 }
 
+interface SmartSearchFormInputs {
+  naturalQuery: string;
+}
+
+interface SmartSearchResult {
+  username: string;
+  confidence: number;
+  explanation: string;
+}
+
+// Add import for SmartSearch component
+import SmartSearch from "../components/SmartSearch";
+
 export default function Home() {
   const [searchResults, setSearchResults] = useState<TikTokUser[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [exportFormat, setExportFormat] = useState<"json" | "csv">("json");
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const [activeTab, setActiveTab] = useState<'search' | 'trending' | 'posts'>('search');
+  const [activeTab, setActiveTab] = useState('search');
   const [trendingCreators, setTrendingCreators] = useState<TrendingCreator[]>([]);
   const [loadingTrending, setLoadingTrending] = useState(false);
   const [userPosts, setUserPosts] = useState<{[key: string]: TikTokPost[]}>({});
@@ -153,6 +165,9 @@ export default function Home() {
   const [selectedUser, setSelectedUser] = useState<TikTokUser | null>(null);
   const [showAnalysisModal, setShowAnalysisModal] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [smartSearchResult, setSmartSearchResult] = useState<SmartSearchResult | null>(null);
+  const [specificUserResult, setSpecificUserResult] = useState<TikTokUser | null>(null);
+  const [smartSearchLoading, setSmartSearchLoading] = useState(false);
 
   const {
     register,
@@ -166,6 +181,16 @@ export default function Home() {
     handleSubmit: handleSubmitPostSearch,
     formState: { errors: postSearchErrors },
   } = useForm<PostSearchFormInputs>();
+
+  const {
+    register: registerSmartSearch,
+    handleSubmit: handleSubmitSmartSearch,
+    formState: { errors: smartSearchErrors },
+  } = useForm<SmartSearchFormInputs>({
+    defaultValues: {
+      naturalQuery: ""
+    }
+  });
 
   const queryValue = watch("query");
 
@@ -483,6 +508,41 @@ export default function Home() {
     setSelectedUser(null);
   };
 
+  // Smart search handler
+  const handleSmartSearch = async (data: SmartSearchFormInputs) => {
+    setSmartSearchLoading(true);
+    setSmartSearchResult(null);
+    setSpecificUserResult(null);
+    setError(null);
+
+    try {
+      // First, call the smart-search endpoint
+      const smartSearchResponse = await axios.post('http://localhost:8000/smart-search', {
+        query: data.naturalQuery
+      });
+
+      const smartResult = smartSearchResponse.data;
+      setSmartSearchResult(smartResult);
+
+      // Then fetch the user details for the suggested username
+      try {
+        const userResponse = await axios.get(`http://localhost:8000/user-details/${smartResult.username}`);
+        
+        if (userResponse.data) {
+          setSpecificUserResult(userResponse.data);
+        }
+      } catch (userError) {
+        console.error("Error fetching specific user:", userError);
+        // We still show the smart search result even if user details failed
+      }
+    } catch (err) {
+      console.error(err);
+      setError("Error performing smart search. Please try again.");
+    } finally {
+      setSmartSearchLoading(false);
+    }
+  };
+
   return (
     <main className="min-h-screen bg-gray-100">
       {/* Analysis Modal */}
@@ -503,7 +563,7 @@ export default function Home() {
               <div className="mb-6 flex items-center">
                 {selectedUser.profile_pic && (
                   <div className="relative w-16 h-16 rounded-full overflow-hidden mr-4">
-                    <Image 
+        <Image
                       src={`data:image/jpeg;base64,${selectedUser.profile_pic}`}
                       alt={`${selectedUser.display_name} profile`}
                       width={64}
@@ -617,6 +677,15 @@ export default function Home() {
               }}
             >
               Trending Creators
+            </button>
+            <button
+              type="button"
+              className={`px-6 py-2 text-sm font-medium ${activeTab === 'smart' 
+                ? 'bg-blue-600 text-white' 
+                : 'bg-white text-gray-700 hover:bg-gray-50'} border border-gray-200`}
+              onClick={() => setActiveTab('smart')}
+            >
+              Smart Search
             </button>
           </div>
         </div>
@@ -820,7 +889,7 @@ export default function Home() {
                           <div className="flex items-center mb-4">
                             {avatar && (
                               <div className="relative w-16 h-16 rounded-full overflow-hidden mr-4">
-                                <Image 
+            <Image
                                   src={avatar}
                                   alt={`${displayName} profile`}
                                   width={64}
@@ -851,8 +920,8 @@ export default function Home() {
                             {username ? (
                               <a 
                                 href={`https://www.tiktok.com/@${username}`}
-                                target="_blank"
-                                rel="noopener noreferrer"
+            target="_blank"
+            rel="noopener noreferrer"
                                 className="text-blue-600 hover:underline text-sm"
                               >
                                 View TikTok Profile →
@@ -868,7 +937,7 @@ export default function Home() {
                 </div>
               )}
             </div>
-          </div>
+        </div>
         )}
 
         {activeTab === 'search' && searchResults.length > 0 && (
@@ -901,7 +970,7 @@ export default function Home() {
                   <div className="flex items-center mb-4">
                     {user.profile_pic && (
                       <div className="relative w-16 h-16 rounded-full overflow-hidden mr-4">
-                        <Image 
+          <Image
                           src={`data:image/jpeg;base64,${user.profile_pic}`}
                           alt={`${user.display_name} profile`}
                           width={64}
@@ -963,8 +1032,8 @@ export default function Home() {
                     {user.username && (
                       <a 
                         href={`https://www.tiktok.com/@${user.username}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
+          target="_blank"
+          rel="noopener noreferrer"
                         className="text-blue-600 hover:underline text-sm"
                       >
                         View TikTok Profile →
@@ -1189,7 +1258,7 @@ export default function Home() {
                                     unoptimized
                                   />
                                 ) : post.author.avatar_thumb?.url_list?.[0] ? (
-                                  <Image
+          <Image
                                     src={post.author.avatar_thumb.url_list[0]}
                                     alt="Author"
                                     width={32}
@@ -1233,8 +1302,8 @@ export default function Home() {
                             {post.author?.unique_id && (
                               <a
                                 href={`https://www.tiktok.com/@${post.author.unique_id}`}
-                                target="_blank"
-                                rel="noopener noreferrer"
+          target="_blank"
+          rel="noopener noreferrer"
                                 className="text-xs px-3 py-1.5 rounded border border-blue-600 text-blue-600 hover:bg-blue-50"
                               >
                                 View Profile
@@ -1256,7 +1325,14 @@ export default function Home() {
             )}
           </div>
         )}
-      </div>
+
+        {/* Smart Search Form */}
+        {activeTab === 'smart' && (
+          <div className="mb-8">
+            <SmartSearch />
+          </div>
+        )}
+    </div>
     </main>
   );
 }
