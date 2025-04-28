@@ -47,6 +47,7 @@ interface TikTokUser {
   likes_count: number;
   verified: boolean;
   profile_pic: string;
+  tiktok_url?: string;
   analysis_result?: AnalysisResult;
 }
 
@@ -425,6 +426,35 @@ export default function Home() {
     }, 100);
   }
 
+  const downloadPost = async (post: any, postKey: string) => {
+    if (downloadingVideo[postKey]) return;
+    
+    setDownloadingVideo(prev => ({ ...prev, [postKey]: true }));
+    setDownloadDisabled(true);
+    
+    try {
+      // Check if video_url exists directly in the post object
+      if (post.video_url) {
+        triggerDownload(post.video_url, `tiktok-${post.id}.mp4`);
+      } else {
+        // Fallback to the download API endpoint if direct URL not available
+        const response = await axios.get(`${API_BASE_URL}/download-video/${post.id}`);
+        
+        if (response.data && response.data.video_url) {
+          triggerDownload(response.data.video_url, `tiktok-${post.id}.mp4`);
+        } else {
+          setError("Video URL not found. Try another video.");
+        }
+      }
+    } catch (error) {
+      console.error("Error downloading video:", error);
+      setError("Failed to download video. Please try again.");
+    } finally {
+      setDownloadingVideo(prev => ({ ...prev, [postKey]: false }));
+      setDownloadDisabled(false);
+    }
+  }
+
   const runDeepAnalysis = async (userId: string, query: string) => {
     setIsAnalyzing(true);
     try {
@@ -570,13 +600,28 @@ export default function Home() {
                   )}
                 </div>
               ) : (
-                <div className="text-center py-8">
-                  <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-blue-500 mx-auto mb-4"></div>
-                  <p className="text-gray-600">Analyzing user content...</p>
+              error ? (
+                <div className="bg-red-50 border border-red-200 rounded-md p-4 mb-8">
+                  <p className="text-red-700">{error}</p>
                 </div>
-              )}
-            </div>
+              ) : loadingPostSearch ? (
+                <div className="bg-white rounded-lg shadow-md p-6 flex justify-center items-center py-12">
+                  <p className="text-gray-500">Searching for posts...</p>
+                </div>
+              ) : (
+                <div className="bg-white rounded-lg shadow-md p-6 flex justify-center items-center py-12">
+                  <p className="text-gray-500">No posts found. Try a different search.</p>
+                </div>
+              )
+            )}
           </div>
+        )}
+      </div>
+
+      {isAnalyzing && (
+        <div className="text-center py-8">
+          <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-blue-500 mx-auto mb-4"></div>
+          <p className="text-gray-600">Analyzing user content...</p>
         </div>
       )}
       
@@ -801,7 +846,26 @@ export default function Home() {
                   <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500"></div>
                 </div>
               ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+              error ? (
+                <div className="bg-red-50 border border-red-200 rounded-md p-4 mb-8">
+                  <p className="text-red-700">{error}</p>
+                </div>
+              ) : loadingPostSearch ? (
+                <div className="bg-white rounded-lg shadow-md p-6 flex justify-center items-center py-12">
+                  <p className="text-gray-500">Searching for posts...</p>
+                </div>
+              ) : (
+                <div className="bg-white rounded-lg shadow-md p-6 flex justify-center items-center py-12">
+                  <p className="text-gray-500">No posts found. Try a different search.</p>
+                </div>
+              )
+            )}
+          </div>
+        )}
+      </div>
+    </main>
+  );
+}                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                   {trendingCreators.map((creator, index) => {
                     // Extract data from potentially different response formats
                     const user = creator.user_info || creator;
@@ -857,7 +921,26 @@ export default function Home() {
                                 View TikTok Profile →
                               </a>
                             ) : (
-                              <span className="text-gray-400 text-sm">Profile link unavailable</span>
+              error ? (
+                <div className="bg-red-50 border border-red-200 rounded-md p-4 mb-8">
+                  <p className="text-red-700">{error}</p>
+                </div>
+              ) : loadingPostSearch ? (
+                <div className="bg-white rounded-lg shadow-md p-6 flex justify-center items-center py-12">
+                  <p className="text-gray-500">Searching for posts...</p>
+                </div>
+              ) : (
+                <div className="bg-white rounded-lg shadow-md p-6 flex justify-center items-center py-12">
+                  <p className="text-gray-500">No posts found. Try a different search.</p>
+                </div>
+              )
+            )}
+          </div>
+        )}
+      </div>
+    </main>
+  );
+}                              <span className="text-gray-400 text-sm">Profile link unavailable</span>
                             )}
                           </div>
                         </div>
@@ -961,9 +1044,9 @@ export default function Home() {
                   <div className="mt-4 flex flex-wrap gap-2">
                     {user.username && (
                       <a 
-                        href={`https://www.tiktok.com/@${user.username}`}
-          target="_blank"
-          rel="noopener noreferrer"
+                        href={user.tiktok_url || `https://www.tiktok.com/@${user.username}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
                         className="text-blue-600 hover:underline text-sm"
                       >
                         View TikTok Profile →
@@ -1188,7 +1271,7 @@ export default function Home() {
                                     unoptimized
                                   />
                                 ) : post.author.avatar_thumb?.url_list?.[0] ? (
-          <Image
+                                  <Image
                                     src={post.author.avatar_thumb.url_list[0]}
                                     alt="Author"
                                     width={32}
@@ -1220,21 +1303,21 @@ export default function Home() {
                             </div>
                           </div>
                           
-                          <div className="flex gap-2">
+                          <div className="flex flex-wrap gap-2">
                             <button
-                              onClick={() => videoUrl && downloadVideo(videoUrl, postId)}
-                              disabled={!videoUrl || downloadingVideo[postId] || downloadDisabled}
-                              className="text-xs px-3 py-1.5 rounded bg-green-600 text-white hover:bg-green-700 focus:outline-none disabled:opacity-50"
+                              onClick={() => downloadPost(post, index.toString())}
+                              disabled={downloadDisabled}
+                              className="px-3 py-1 bg-blue-500 text-white text-xs rounded hover:bg-blue-600 disabled:bg-blue-300"
                             >
-                              {downloadingVideo[postId] ? 'Downloading...' : 'Download'}
+                              {downloadingVideo[index.toString()] ? 'Downloading...' : 'Download'}
                             </button>
                             
                             {post.author?.unique_id && (
                               <a
                                 href={`https://www.tiktok.com/@${post.author.unique_id}`}
-          target="_blank"
-          rel="noopener noreferrer"
-                                className="text-xs px-3 py-1.5 rounded border border-blue-600 text-blue-600 hover:bg-blue-50"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="px-3 py-1 text-blue-600 text-xs rounded border border-blue-600 hover:bg-blue-50"
                               >
                                 View Profile
                               </a>
@@ -1247,15 +1330,23 @@ export default function Home() {
                 </div>
               </div>
             ) : (
-              error && (
+              error ? (
                 <div className="bg-red-50 border border-red-200 rounded-md p-4 mb-8">
                   <p className="text-red-700">{error}</p>
+                </div>
+              ) : loadingPostSearch ? (
+                <div className="bg-white rounded-lg shadow-md p-6 flex justify-center items-center py-12">
+                  <p className="text-gray-500">Searching for posts...</p>
+                </div>
+              ) : (
+                <div className="bg-white rounded-lg shadow-md p-6 flex justify-center items-center py-12">
+                  <p className="text-gray-500">No posts found. Try a different search.</p>
                 </div>
               )
             )}
           </div>
         )}
-    </div>
+      </div>
     </main>
   );
 }

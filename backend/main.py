@@ -1,1436 +1,1879 @@
+"""
+TikTok Analyzer Backend
+-----------------------
+A Flask API for searching and analyzing TikTok content using Tavily API, 
+ScrapTik API, and OpenAI GPT for enhanced relevance scoring.
+"""
+
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import List, Dict, Optional, Any, Union
 import requests
-import os
-import base64
+import re
+import random
 import json
+import time
+from typing import List, Dict, Optional, Any
 from dotenv import load_dotenv
-from typing import List, Dict, Any, Optional
-from pydantic import BaseModel
-import io
-from PIL import Image
+import os
 import openai
+import asyncio
 
-# Load environment variables
-load_dotenv()
+# Import custom helpers
+from security_privacy_helpers import is_security_privacy_focused, security_privacy_relevance_score
 
-app = FastAPI(title="TikTok Analyzer")
+# Import the official Tavily Python client
+try:
+    from tavily import TavilyClient
+    TAVILY_CLIENT_AVAILABLE = True
+except ImportError:
+    TAVILY_CLIENT_AVAILABLE = False
+    print("⚠️ Tavily Python client not available. Consider installing with: pip install tavily-python")
 
-# Configure CORS
+# Initialize FastAPI
+app = FastAPI(title="TikTok Analyzer API")
+
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://tiktok-analyzer-production.up.railway.app","*"],  # In production, specify your frontend domain
+    allow_origins=["*"],  # For development; restrict in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# API Keys
+# Load environment variables
+load_dotenv()
 RAPID_API_KEY = os.getenv("RAPID_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
-# Configure OpenAI client
-openai_client = openai.OpenAI(
-    api_key=OPENAI_API_KEY,
-    base_url="https://api.openai.com/v1"
-)
-
-# ScrapTik API base URL
+# ScrapTik API setup
 BASE_URL = "https://scraptik.p.rapidapi.com"
-
-# Common headers for ScrapTik API
 headers = {
     "X-RapidAPI-Key": RAPID_API_KEY,
     "X-RapidAPI-Host": "scraptik.p.rapidapi.com"
 }
 
-# Models
-class UserCriteria(BaseModel):
-    min_followers: Optional[int] = 0
-    max_followers: Optional[int] = None
-    min_following: Optional[int] = 0
-    max_following: Optional[int] = None
-    min_likes: Optional[int] = 0
-    max_likes: Optional[int] = None
-    verified: Optional[bool] = None
+# Alternative API endpoints from ScrapTik docs
+ENDPOINTS = {
+    "user_info": f"{BASE_URL}/user-info",  # Primary endpoint for user data
+    "web_user": f"{BASE_URL}/web/get-user",  # Web endpoint for user data
+    "search_users": f"{BASE_URL}/search-users",  # Search users endpoint
+    "username_to_id": f"{BASE_URL}/username-to-id",  # Convert username to ID
+    "user_posts": f"{BASE_URL}/user-posts"  # Get user videos
+}
 
-class SearchRequest(BaseModel):
+# Alternative API provider
+BASE_URL_ALTERNATIVE = "https://tiktok-video-no-watermark2.p.rapidapi.com"
+headers_alternative = {
+    "X-RapidAPI-Key": RAPID_API_KEY,
+    "X-RapidAPI-Host": "tiktok-video-no-watermark2.p.rapidapi.com"
+}
+
+# Configure OpenAI client
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+#-----------------------------------------------------------------------------
+# Pydantic Models
+#-----------------------------------------------------------------------------
+
+class WebEnhancedSearchRequest(BaseModel):
+    """Request model for web-enhanced TikTok search"""
     query: str
-    criteria: UserCriteria
-    count: Optional[int] = 20
-    deep_analysis: Optional[bool] = False
+    max_results: int = 5
+    min_relevance_score: float = 0.5
 
-class AnalysisResult(BaseModel):
-    relevant: bool
-    score: float
-    explanation: str
-    image_analysis: Optional[str] = None
-    thumbnail_analysis: Optional[str] = None
+class TikTokUsername(BaseModel):
+    """Model for TikTok username extracted from web search"""
+    username: str
+    source: str
+    context: Optional[str] = None
+    search_relevance: Optional[float] = None
 
-class TikTokUser(BaseModel):
-    id: str
+class WebEnhancedUserMatch(BaseModel):
+    """Model for matched TikTok user with relevance scoring"""
     username: str
     display_name: str
     bio: str
     follower_count: int
-    following_count: int
-    likes_count: int
-    verified: bool
     profile_pic: str
-    analysis_result: Optional[AnalysisResult] = None
+    why_matches: str
+    relevance_score: float
+    discovery_method: str
+    videos: Optional[List[Dict]] = []
 
-class PostSearchRequest(BaseModel):
-    keyword: str
-    count: Optional[int] = 20
-    offset: Optional[int] = 0
-    use_filters: Optional[int] = 0
-    publish_time: Optional[int] = 0
-    sort_type: Optional[int] = 0
-
-class ContentAnalysisRequest(BaseModel):
-    user_id: str
+class WebEnhancedSearchResponse(BaseModel):
+    """Response model for web-enhanced search"""
     query: str
+    required_criteria: List[str] = []
+    matches: List[WebEnhancedUserMatch] = []
+    search_strategy: str = ""
+    usernames_found: int = 0
+    profiles_analyzed: int = 0
 
-class SmartSearchRequest(BaseModel):
-    query: str
+#-----------------------------------------------------------------------------
+# Tavily Search Integration
+#-----------------------------------------------------------------------------
 
-class SmartSearchResult(BaseModel):
-    username: str
-    confidence: float
-    explanation: str
-
-# Helper Functions
-def get_image_as_base64(url):
-    try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            return base64.b64encode(response.content).decode('utf-8')
-        return None
-    except Exception as e:
-        print(f"Error fetching image: {e}")
-        return None
-
-def analyze_profile_picture(base64_image, query):
-    """Analyze the profile picture using OpenAI Vision API"""
-    try:
-        # Check if OpenAI API key is configured
-        if not OPENAI_API_KEY or OPENAI_API_KEY == "YOUR_OPENAI_API_KEY_HERE":
-            return "OpenAI API key not configured. Cannot analyze profile picture."
+def perform_tavily_search(query: str, max_results: int = 10) -> Optional[Dict]:
+    """
+    Perform a search for TikTok profiles using Tavily API
+    
+    Args:
+        query: The search query
+        max_results: Maximum number of results to return
         
-        # Now we're actually using Vision API
-        try:
-            response = openai_client.chat.completions.create(
-                model="gpt-4-vision-preview",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": f"This is a TikTok profile picture. Based on the query '{query}', is this person likely relevant? Provide a brief analysis focusing on visual elements that might indicate relevance to the query."},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                max_tokens=300
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"Error using Vision API: {str(e)}")
-            return f"Could not analyze image: {str(e)}"
+    Returns:
+        Dict containing Tavily search results or None if search failed
+    """
+    try:
+        print(f"==== PERFORMING TAVILY SEARCH ====\nQuery: {query}")
+        
+        if not TAVILY_API_KEY:
+            print("ERROR: Tavily API key not configured")
+            return None
             
-    except Exception as e:
-        print(f"Error analyzing profile picture: {str(e)}")
-        return "Could not analyze profile picture due to an error."
-
-def analyze_thumbnail(base64_image, query):
-    """Analyze a video thumbnail using OpenAI Vision API"""
-    try:
-        # Check if OpenAI API key is configured
-        if not OPENAI_API_KEY or OPENAI_API_KEY == "YOUR_OPENAI_API_KEY_HERE":
-            return "OpenAI API key not configured. Cannot analyze thumbnail."
-        
-        try:
-            response = openai_client.chat.completions.create(
-                model="gpt-4-vision-preview",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": f"This is a TikTok video thumbnail. Based on the query '{query}', does this content appear to be relevant? Look for visual elements related to the query."},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                max_tokens=300
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"Error using Vision API for thumbnail: {str(e)}")
-            return f"Could not analyze thumbnail: {str(e)}"
-            
-    except Exception as e:
-        print(f"Error analyzing thumbnail: {str(e)}")
-        return "Could not analyze thumbnail due to an error."
-
-def analyze_user_content(user, query):
-    """Analyze if a user's content is relevant to the query using OpenAI"""
-    try:
-        # Initialize default variables for fallback scenarios
-        relevance_score = 0.0
-        explanation = []
-        final_explanation = "Could not analyze user content."
-        
-        # Parse the query to understand user intent
-        query_parts = query.lower().split()
-        
-        # Extract key components from the query (topics, locations, professions, etc.)
-        locations = []
-        professions = []
-        topics = []
-        key_terms = []
-        
-        # Enhanced extraction of potential entities
-        location_indicators = ["from", "in", "based in", "living in"]
-        profession_indicators = ["influencer", "creator", "youtuber", "streamer", "blogger", "vlogger", 
-                                "teacher", "expert", "professional", "specialist", "enthusiast"]
-        
-        # Track if we're looking for a specific type of creator
-        seeking_creator_type = False
-        for term in profession_indicators:
-            if term in query.lower():
-                seeking_creator_type = True
-                break
-        
-        for i, term in enumerate(query_parts):
-            # Check for location patterns ("from X", "in X")
-            if term in location_indicators and i < len(query_parts) - 1:
-                possible_location = query_parts[i+1]
-                locations.append(possible_location)
+        # Construct domain-specific search queries based on the query type
+        if "security" in query.lower() or "privacy" in query.lower():
+            # Security/privacy focused query
+            sub_topics = []
+            if "security" in query.lower():
+                sub_topics.append("cybersecurity")
+            if "privacy" in query.lower():
+                sub_topics.append("data privacy")
                 
-                # Handle multi-word locations like "south africa"
-                if i < len(query_parts) - 2:
-                    potential_location = f"{query_parts[i+1]} {query_parts[i+2]}"
-                    locations.append(potential_location)
+            if sub_topics:
+                specific_topics = " and ".join(sub_topics)
+                enhanced_query = f"best TikTok {specific_topics} experts OR popular {specific_topics} influencers on TikTok"
+            else:
+                enhanced_query = f"top TikTok influencers specializing in {query}"
                 
-                # Handle three-word locations like "new york city"
-                if i < len(query_parts) - 3:
-                    potential_location = f"{query_parts[i+1]} {query_parts[i+2]} {query_parts[i+3]}"
-                    locations.append(potential_location)
-            
-            # Check for profession/role terms
-            if term in profession_indicators:
-                professions.append(term)
-                # Check if there's a modifier before the profession (e.g., "tech influencer")
-                if i > 0:
-                    topics.append(query_parts[i-1])
-                    professions.append(f"{query_parts[i-1]} {term}")
-            
-            # Add all terms as potential key terms
-            if len(term) > 3 and term not in location_indicators and term not in ["and", "the", "for", "with"]:
-                key_terms.append(term)
+        elif "from" in query.lower() or "in" in query.lower():
+            # Location-specific query
+            location_parts = re.split(r'\sfrom\s|\sin\s', query.lower())
+            if len(location_parts) > 1:
+                topic = location_parts[0].strip()
+                location = location_parts[1].strip()
+                enhanced_query = f"top {topic} TikTok influencers from {location} 2025 OR most popular {location} TikTokers who create {topic} content"
+            else:
+                enhanced_query = f"best TikTok creators focused on {query}"
+        else:
+            # General topic query
+            topic_terms = query.lower().replace("influencer", "").replace("creator", "").strip()
+            enhanced_query = f"most popular TikTok accounts focused on {topic_terms} OR top {topic_terms} experts on TikTok 2025"
         
-        # If no specific entities were found, treat all query terms as important
-        if not locations and not professions and not topics:
-            topics = [term for term in query_parts if len(term) > 3 and term not in ["from", "with", "and", "the"]]
+        print(f"Enhanced search query: {enhanced_query}")
         
-        # Prepare user data for analysis
-        user_data = {
-            "username": user.get("uniqueId", user.get("unique_id", "")),
-            "display_name": user.get("nickname", ""),
-            "bio": user.get("signature", ""),
-            "stats": {
-                "follower_count": user.get("followerCount", 0),
-                "following_count": user.get("followingCount", 0),
-                "likes": user.get("heartCount", 0),
-            },
-            "verified": user.get("verified", False),
+        # 1. Use the official Tavily Python client if available
+        if TAVILY_CLIENT_AVAILABLE:
+            try:
+                client = TavilyClient(api_key=TAVILY_API_KEY)
+                
+                # Use the official client to search
+                data = client.search(
+                    query=enhanced_query,
+                    search_depth="advanced",
+                    include_domains=[
+                        "tiktok.com", "tokfluence.com", "heepsy.com", "influencermarketinghub.com", 
+                        "hiveinfluence.io", "starngage.com", "favikon.com", "socialtracker.io", 
+                        "socialblade.com", "omniinfluencer.com", "tokboard.com", "affable.ai"
+                    ],
+                    include_answer=True,
+                    include_images=True,
+                    max_results=max_results
+                )
+                
+                result_count = len(data.get('results', []))
+                print(f"✅ Tavily API client success - found {result_count} results")
+                
+                # Log first result for debugging
+                if result_count > 0:
+                    first_result = data['results'][0]
+                    print(f"First result: {first_result.get('title')} - {first_result.get('url')}")
+                
+                return data
+                
+            except Exception as client_error:
+                print(f"⚠️ Tavily client error: {str(client_error)}. Falling back to direct API call.")
+                # Fall through to direct API call
+        
+        # 2. Fallback: Use direct API call
+        search_url = "https://api.tavily.com/search"
+        headers = {
+            "Authorization": f"Bearer {TAVILY_API_KEY}",
+            "Content-Type": "application/json"
         }
         
-        # Get post captions if available
-        post_captions = []
-        if "aweme_list" in user and isinstance(user["aweme_list"], list):
-            for post in user["aweme_list"]:
-                if "desc" in post and post["desc"]:
-                    post_captions.append(post["desc"])
+        payload = {
+            "query": enhanced_query,
+            "search_depth": "advanced",
+            "max_results": max_results,
+            "include_domains": [
+                "tiktok.com", "tokfluence.com", "heepsy.com", "influencermarketinghub.com", 
+                "hiveinfluence.io", "starngage.com", "favikon.com", "socialtracker.io", 
+                "socialblade.com", "omniinfluencer.com", "tokboard.com", "affable.ai"
+            ],
+            "include_answer": True,
+            "include_images": True
+        }
         
-        # Check if OpenAI API key is configured
-        if not OPENAI_API_KEY or OPENAI_API_KEY == "YOUR_OPENAI_API_KEY_HERE":
-            # Perform enhanced relevance matching without API
-            relevance_score = 0.0
-            explanation = []
-            
-            # Get profile data
-            username = user_data["username"].lower()
-            display_name = user_data["display_name"].lower()
-            bio = user_data["bio"].lower()
-            
-            # Combine all post captions
-            all_captions = " ".join(post_captions).lower()
-            
-            # STEP 1: Check for strong indicators of a generic/location account rather than an influencer
-            is_generic_account = False
-            
-            # Check for usernames that exactly match a location
-            for location in locations:
-                location_lower = location.lower()
-                if (username == location_lower or 
-                    username == f"{location_lower}.com" or
-                    username == f"{location_lower}_official" or
-                    username == f"official_{location_lower}" or
-                    username == f"{location_lower}_com" or
-                    username.startswith(f"{location_lower}_") or
-                    username.endswith(f"_{location_lower}")):
-                    is_generic_account = True
-                    explanation.append(f"Username '{username}' appears to be a generic account about {location_lower}")
-                    break
-            
-            # Check for ALL CAPS display names which often indicate official accounts
-            if display_name.upper() == display_name and len(display_name.split()) <= 2:
-                is_generic_account = True
-                explanation.append(f"ALL CAPS display name '{display_name}' suggests an official account")
-            
-            # Check for "official" indicators
-            if "official" in username or "official" in display_name:
-                is_generic_account = True
-                explanation.append("Profile contains 'official' in name, suggesting a brand account")
-            
-            # If we're looking for a specific type of creator but bio is empty, it's unlikely to be relevant
-            if seeking_creator_type and not bio.strip():
-                is_generic_account = True
-                explanation.append("Profile has empty bio, unlikely to be a content creator")
-            
-            # STEP 2: Check for positive indicators if not already flagged as generic account
-            if not is_generic_account:
-                # Check if bio indicates creator status
-                creator_bio_indicators = ["creator", "influencer", "content", "blog", "posts", "videos", "sharing", "youtube", 
-                                         "instagram", "follow me", "follow for", "dm for", "business", "collab"]
-                bio_creator_score = 0
-                for indicator in creator_bio_indicators:
-                    if indicator in bio:
-                        bio_creator_score += 0.1
-                        
-                if bio_creator_score > 0:
-                    relevance_score += min(0.3, bio_creator_score)
-                    explanation.append("Bio suggests this is a content creator")
-                
-                # Check for location matches
-                location_match = False
-                for location in locations:
-                    # Check bio first (most reliable indicator they're from that location)
-                    location_phrases = [f"from {location}", f"based in {location}", f"in {location}", f"{location} based", 
-                                       f"{location} creator", f"{location} influencer"]
-                    
-                    for phrase in location_phrases:
-                        if phrase in bio.lower():
-                            location_match = True
-                            relevance_score += 0.3
-                            explanation.append(f"Bio explicitly mentions being from {location}")
-                            break
-                    
-                    # Less reliable location indicators
-                    if not location_match:
-                        if (location in bio or location in all_captions):
-                            location_match = True
-                            relevance_score += 0.2
-                            explanation.append(f"Content mentions '{location}'")
-                            break
-                
-                # Check for profession/role matches
-                profession_match = False
-                for profession in professions:
-                    # Strong indicator: profession in bio
-                    if profession in bio:
-                        profession_match = True
-                        relevance_score += 0.3
-                        explanation.append(f"Bio mentions '{profession}'")
-                        break
-                    
-                    # Weaker indicators: profession in captions or display name
-                    if not profession_match and (profession in display_name or profession in all_captions):
-                        profession_match = True
-                        relevance_score += 0.2
-                        explanation.append(f"Profile indicates '{profession}' role")
-                        break
-                
-                # Check for topic matches
-                topic_match = False
-                for topic in topics:
-                    if topic in bio:
-                        topic_match = True
-                        relevance_score += 0.25
-                        explanation.append(f"Bio shows interest in '{topic}'")
-                        break
-                    
-                    if not topic_match and (topic in display_name or topic in all_captions):
-                        topic_match = True
-                        relevance_score += 0.15
-                        explanation.append(f"Content related to '{topic}'")
-                        break
-                
-                # Analyze post captions for relevance
-                if post_captions:
-                    topic_caption_matches = 0
-                    for caption in post_captions:
-                        caption_lower = caption.lower()
-                        for topic in topics:
-                            if topic in caption_lower:
-                                topic_caption_matches += 1
-                                break
-                    
-                    caption_relevance = topic_caption_matches / max(1, len(post_captions))
-                    if caption_relevance > 0.3:
-                        relevance_score += 0.2
-                        explanation.append("Multiple post captions match search topics")
-                    elif caption_relevance > 0:
-                        relevance_score += 0.1
-                        explanation.append("Some post captions match search topics")
-            
-            # STEP 3: Apply penalties for generic accounts
-            if is_generic_account:
-                relevance_score -= 0.5
-            
-            # Check specifically for case where username exactly matches a location from query
-            # This is a very strong indicator of a generic page when searching for an influencer
-            if seeking_creator_type:
-                for location in locations:
-                    location_lower = location.lower().replace(" ", "")
-                    username_clean = username.replace(".", "").replace("_", "")
-                    if username_clean == location_lower:
-                        relevance_score -= 0.4
-                        explanation.append(f"Username exactly matches location '{location}', not an individual creator")
-            
-            # Cap the score between 0 and 1
-            relevance_score = max(0.0, min(1.0, relevance_score))
-            
-            # Generate final explanation
-            if not explanation:
-                final_explanation = "Profile shows limited relevance to your search criteria."
-            else:
-                final_explanation = ". ".join(explanation[:3]) + "."
-            
-            return AnalysisResult(
-                relevant=relevance_score > 0.3,
-                score=relevance_score,
-                explanation=final_explanation,
-                image_analysis="Image analysis not available without OpenAI API",
-                thumbnail_analysis="Thumbnail analysis not available without OpenAI API"
-            )
+        print(f"Tavily API request: {search_url}")
+        print(f"Payload: {json.dumps(payload, indent=2)}")
         
-        # Profile picture analysis if available
-        profile_pic_analysis = ""
-        if user.get("avatarMedium"):
-            try:
-                profile_pic_base64 = get_image_as_base64(user.get("avatarMedium"))
-                if profile_pic_base64:
-                    profile_pic_analysis = analyze_profile_picture(profile_pic_base64, query)
-            except Exception as e:
-                print(f"Error analyzing profile picture: {str(e)}")
-                profile_pic_analysis = "Error analyzing profile picture"
+        # Execute search with timeout
+        response = requests.post(search_url, headers=headers, json=payload, timeout=15)
         
-        # Try to get a thumbnail from a recent video if available
-        thumbnail_analysis = ""
-        try:
-            if "aweme_list" in user and isinstance(user["aweme_list"], list) and len(user["aweme_list"]) > 0:
-                video = user["aweme_list"][0]
-                if "video" in video and "cover" in video["video"]:
-                    cover_url = None
-                    if isinstance(video["video"]["cover"], str):
-                        cover_url = video["video"]["cover"]
-                    elif isinstance(video["video"]["cover"], dict) and "url_list" in video["video"]["cover"]:
-                        if video["video"]["cover"]["url_list"] and len(video["video"]["cover"]["url_list"]) > 0:
-                            cover_url = video["video"]["cover"]["url_list"][0]
-                    
-                    if cover_url:
-                        thumbnail_base64 = get_image_as_base64(cover_url)
-                        if thumbnail_base64:
-                            thumbnail_analysis = analyze_thumbnail(thumbnail_base64, query)
-        except Exception as e:
-            print(f"Error analyzing thumbnail: {str(e)}")
-            thumbnail_analysis = "Error analyzing thumbnail"
-
-        # Extract post captions for content analysis
-        captions_text = ""
-        if post_captions:
-            captions_text = "\nRecent post captions:\n- " + "\n- ".join(post_captions[:5])
-
-        # Try content relevance analysis with GPT if quota allows
-        try:
-            # Improved content relevance analysis prompt
-            prompt = f"""
-            Analyze this TikTok user's profile in relation to the search query: "{query}"
+        if response.status_code == 200:
+            data = response.json()
+            result_count = len(data.get('results', []))
+            print(f"✅ Tavily API success - found {result_count} results")
             
-            User data:
-            {json.dumps(user_data, indent=2)}
+            # Log first result for debugging
+            if result_count > 0:
+                first_result = data['results'][0]
+                print(f"First result: {first_result.get('title')} - {first_result.get('url')}")
             
-            {captions_text}
+            return data
+        else:
+            print(f"❌ Tavily API error: {response.status_code} - {response.text}")
+            return None
             
-            Profile picture analysis: {profile_pic_analysis}
-            
-            Thumbnail analysis: {thumbnail_analysis}
-            
-            Is this user relevant to the search query? Please analyze:
-            
-            1. User Type Analysis:
-               - Is this user an individual content creator/influencer or a generic/official account?
-               - Does this appear to be a personal account of a real person or a branded/location page?
-               - If the query is looking for an influencer/creator and this is just a generic page about a location/topic, score it VERY LOW.
-            
-            2. Content Relevance:
-               - Based on bio, captions and profile, does this user actually create content matching the search topic?
-               - Is there evidence in their captions that they post about the topic in the query?
-            
-            3. Location Relevance:
-               - If a location was specified in the query, is there evidence this user is actually from that location?
-               - Or are they just using the location name without being from there?
-            
-            4. CRITICAL: Low relevance indicators:
-               - Username exactly matching a location name (e.g., "southafrica" when searching for "tech influencer from South Africa")
-               - ALL CAPS display name with no personal information
-               - Generic account with no personal identity
-               - Empty or generic bio with no topic-specific content
-            
-            Rate this profile from 0.0 (completely irrelevant) to 1.0 (perfect match) on how well it matches the search query's INTENT.
-            For example, if someone searches "tech influencer from South Africa", a generic account named "SOUTH AFRICA" should get a score near 0.
-            
-            Output format:
-            {{
-              "relevant": true/false,
-              "score": 0.0-1.0,
-              "explanation": "Your detailed explanation here"
-            }}
-            """
-            
-            response = openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": "You analyze TikTok profiles for relevance to search queries. You are extremely good at distinguishing between actual influencers/creators and generic topic/location accounts."},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            
-            result = json.loads(response.choices[0].message.content)
-            return AnalysisResult(
-                relevant=result.get("relevant", False),
-                score=result.get("score", 0.0),
-                explanation=result.get("explanation", "No explanation provided"),
-                image_analysis=profile_pic_analysis,
-                thumbnail_analysis=thumbnail_analysis
-            )
-        except Exception as api_error:
-            print(f"OpenAI API error: {str(api_error)}")
-            
-            # Generate final explanation if not already done
-            if not explanation:
-                final_explanation = "Profile shows limited relevance to your search criteria."
-            else:
-                final_explanation = ". ".join(explanation[:3]) + "."
-            
-            # Use the non-API fallback logic we defined above
-            return AnalysisResult(
-                relevant=relevance_score > 0.3,
-                score=relevance_score,
-                explanation=final_explanation,
-                image_analysis="Image analysis not available due to API error",
-                thumbnail_analysis="Thumbnail analysis not available due to API error"
-            )
     except Exception as e:
-        print(f"Error in analyze_user_content: {str(e)}")
-        return AnalysisResult(
-            relevant=False,
-            score=0.0,
-            explanation=f"Error analyzing user: {str(e)}",
-            image_analysis="",
-            thumbnail_analysis=""
-        )
+        print(f"❌ Error performing Tavily search: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        return None
 
-def does_user_match_criteria(user_data, criteria):
-    """Check if a user matches the given filtering criteria"""
-    if not user_data:
+#-----------------------------------------------------------------------------
+# Username Extraction
+#-----------------------------------------------------------------------------
+
+def extract_tiktok_usernames(url: str, title: str, content: str) -> List[str]:
+    """
+    Extract TikTok usernames from search result data
+    
+    Args:
+        url: The URL from search results
+        title: The title from search results
+        content: The content/snippet from search results
+        
+    Returns:
+        List of extracted TikTok usernames
+    """
+    # Initialize list to store valid usernames
+    usernames = []
+    
+    # Combine text for searching
+    combined_text = f"{url} {title} {content}"
+    
+    # Extract from URL directly - most reliable source
+    if "tiktok.com/@" in url:
+        username = url.split("tiktok.com/@")[1].split("/")[0].split("?")[0]
+        if username and username not in usernames and is_valid_tiktok_username(username):
+            usernames.append(username)
+    
+    # General patterns to match TikTok usernames across various formats
+    patterns = [
+        # Standard username patterns
+        r'@([\w\.]{2,24})\b',                       # @username notation with word boundary
+        r'tiktok\.com/@([\w\.]{2,24})\b',          # TikTok URL format
+        
+        # Profile listing patterns (common in ranking sites)
+        r'(?:^|\s)(\w+)\s+·\s+@([\w\.]{2,24})\b',      # "Name · @username" format
+        r'(?:\.|\n|\s)(\w+)\s*@([\w\.]{2,24})\b',        # "Name@username" or "Name @username"
+        r'(\w+)\s*\(\s*@([\w\.]{2,24})\s*\)',         # "Name (@username)" format
+        
+        # List formats (common in influencer listings)
+        r'\d+\.\s*([\w\s]+)\s*[·•]\s*@([\w\.]{2,24})', # "1. Name · @username"
+        r'\d+\.\s*@([\w\.]{2,24})\b',                  # "1. @username"
+        
+        # Additional contextual patterns from influencer directories
+        r'(?:username|handle|account)\s*[:=]\s*@?([\w\.]{2,24})\b',  # "username: username"
+        r'\b(\w+)\s+(?:has|with)\s+\d+(?:K|M)?\s+(?:followers|fans)\b.*?@([\w\.]{2,24})\b', # "Name has 1M followers @username"
+        
+        # Additional patterns for Tavily's structured results
+        r'"(?:username|handle)"\s*:\s*"@?([\w\.]{2,24})"', # JSON-like "username": "username"
+        r'\[([\w\.]{2,24})\]\(https://[\w\.]*tiktok\.com'  # Markdown link format [username](https://tiktok.com...)
+    ]
+    
+    # Process all patterns
+    for pattern in patterns:
+        matches = re.findall(pattern, combined_text)
+        for match in matches:
+            if isinstance(match, tuple):
+                # For patterns with capture groups, try the second group first (usually the username)
+                # as the first group might be the display name
+                username = match[1] if len(match) > 1 and match[1] else match[0]
+            else:
+                username = match
+                
+            # Clean up the username
+            username = username.strip('@').strip()
+            
+            # Validate TikTok username
+            if is_valid_tiktok_username(username) and username not in usernames:
+                usernames.append(username)
+    
+    # Return only usernames that pass the validation filter
+    filtered_usernames = filter_valid_usernames(usernames)
+    return filtered_usernames
+
+def is_valid_tiktok_username(username: str) -> bool:
+    """
+    Validate if a username follows TikTok's username constraints
+    and is not a common word or text fragment
+    """
+    # Length check (TikTok allows 2-24 characters)
+    if not username or len(username) < 2 or len(username) > 24:
+        return False
+        
+    # Character check (letters, numbers, underscores, periods only)
+    if not re.match(r'^[\w\.]+$', username):
+        return False
+        
+    # Must start with a letter or number
+    if not re.match(r'^[a-zA-Z0-9]', username):
         return False
     
-    # Check for follower count in multiple possible fields
-    follower_count = 0
-    for field in ["followerCount", "follower_count", "fans"]:
-        if field in user_data:
-            follower_count = user_data.get(field, 0)
-            break
+    # Filter out common words and fragments that are often false positives
+    common_words = [
+        'tiktok', 'for', 'top', 'best', 'from', 'with', 'has', 'influencer', 
+        'creator', 'africa', 'south', 'asia', 'europe', 'america', 'north', 'usa',
+        'marketing', 'business', 'tech', 'fashion', 'beauty', 'fitness', 'food',
+        'travel', 'srsltid', 'html', 'www', 'http', 'https', 'com', 'net', 'org',
+        'influencers', 'marketers', 'followers', 'popular', 'discover', 'account',
+        'accounts', 'users', 'user', 'handle', 'profile', 'website', 'site', 'page',
+        'pages', 'search', 'find', 'results', 'trending', 'viral', 'famous',
+        'category', 'categories', 'report', 'analysis', 'data', 'stats', 'statistics',
+        'social', 'media', 'platform', 'app', 'rketing'
+    ]
     
-    # Check for following count in multiple possible fields
-    following_count = 0
-    for field in ["followingCount", "following_count", "following"]:
-        if field in user_data:
-            following_count = user_data.get(field, 0)
-            break
-    
-    # Check for likes count in multiple possible fields
-    likes_count = 0
-    # First check direct fields
-    for field in ["heartCount", "heart_count", "likes", "digg_count", "hearts", "total_favorited", "heart", "favorited_count", "total_hearts"]:
-        if field in user_data:
-            likes_count = user_data.get(field, 0)
-            break
-    
-    # If not found, check stats object
-    if likes_count == 0 and "stats" in user_data and isinstance(user_data["stats"], dict):
-        stats = user_data["stats"]
-        for field in ["heartCount", "heart_count", "likes", "digg_count", "hearts", "total_favorited", "heart", "favorited_count", "total_hearts"]:
-            if field in stats:
-                likes_count = stats[field]
-                break
-    
-    # If still not found, check counts object
-    if likes_count == 0 and "counts" in user_data and isinstance(user_data["counts"], dict):
-        counts = user_data["counts"]
-        for field in ["likes", "hearts", "heart", "digg", "total_favorited", "favorited_count", "total_hearts"]:
-            if field in counts:
-                likes_count = counts[field]
-                break
-    
-    verified = user_data.get("verified", user_data.get("is_verified", False))
-    
-    # Check criteria
-    if criteria.min_followers and follower_count < criteria.min_followers:
-        return False
-    if criteria.max_followers and follower_count > criteria.max_followers:
-        return False
-    if criteria.min_following and following_count < criteria.min_following:
-        return False
-    if criteria.max_following and following_count > criteria.max_following:
-        return False
-    if criteria.min_likes and likes_count < criteria.min_likes:
-        return False
-    if criteria.max_likes and likes_count > criteria.max_likes:
-        return False
-    if criteria.verified is not None and verified != criteria.verified:
+    if username.lower() in common_words:
         return False
     
+    # Valid username
     return True
 
-# API Endpoints
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to TikTok Analyzer API"}
-
-@app.get("/test")
-def test_endpoint():
-    """Simple endpoint to test if the API is working"""
-    return {"status": "ok", "message": "API is working properly"}
-
-@app.post("/search-users", response_model=List[TikTokUser])
-async def search_users(request: SearchRequest, background_tasks: BackgroundTasks):
-    """Search for TikTok users based on query and filter criteria"""
-    try:
-        print(f"\n\n==== SEARCH REQUEST ====")
-        print(f"Query: {request.query}")
-        print(f"Criteria: {request.criteria}")
-        print(f"Count: {request.count}")
-        print(f"Deep Analysis: {request.deep_analysis}")
+def filter_valid_usernames(usernames: List[str]) -> List[str]:
+    """
+    Filter a list of possible usernames to only include probably valid ones
+    """
+    if not usernames:
+        return []
         
-        url = f"{BASE_URL}/search-users"
+    # First pass: filter out invalid usernames
+    filtered = [u for u in usernames if is_valid_tiktok_username(u)]
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_filtered = [u for u in filtered if not (u.lower() in seen or seen.add(u.lower()))]
+    
+    return unique_filtered
+
+async def search_directly_on_tiktok(query: str, max_results: int = 5) -> List[TikTokUsername]:
+    """
+    Search for TikTok profiles directly on TikTok using ScrapTik API's search-users endpoint
+    
+    Args:
+        query: Search query
+        max_results: Maximum number of results to return
+        
+    Returns:
+        List of TikTok usernames with relevance scores
+    """
+    try:
+        print(f"\n🎙️ DIRECT TIKTOK SEARCH: {query}")
+        usernames = []
+        
+        # Use search-users endpoint from ScrapTik
+        url = ENDPOINTS["search_users"]
         params = {
-            "keyword": request.query,
-            "count": min(request.count * 2, 50),  # Request more results than needed to filter by relevance
+            "keyword": query.strip(),
+            "count": str(max_results * 2),  # Request more to filter
             "cursor": "0"
         }
         
-        print(f"\n==== MAKING API REQUEST ====")
-        print(f"URL: {url}")
-        print(f"Params: {params}")
-        print(f"Headers: X-RapidAPI-Key: {'*' * 5 + RAPID_API_KEY[-5:] if RAPID_API_KEY else 'Not set'}")
+        print(f"Request: GET {url} with params {params}")
+        response = requests.get(url, headers=headers, params=params, timeout=15)
+        print(f"Response Status: {response.status_code}")
         
-        response = requests.get(url, headers=headers, params=params)
-        
-        print(f"\n==== API RESPONSE ====")
-        print(f"Status Code: {response.status_code}")
-        print(f"Response Text Preview: {response.text[:200]}...")
-        
-        if response.status_code != 200:
-            error_detail = f"Error from ScrapTik API: {response.text}"
-            print(f"API Error: {error_detail}")
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=error_detail
-            )
-        
-        data = response.json()
-        
-        print(f"\n==== PARSED RESPONSE ====")
-        print(f"Response Type: {type(data)}")
-        print(f"API Response Keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dictionary'}")
-        
-        users_data = data.get("user_list", [])
-        print(f"User List Length: {len(users_data)}")
-        
-        if not users_data and isinstance(data, dict):
-            print(f"WARNING: No user_list found. Available keys: {list(data.keys())}")
-        
-        # Try alternative keys if user_list isn't found
-        if not users_data and isinstance(data, dict):
-            for key in data.keys():
-                if isinstance(data[key], list) and len(data[key]) > 0:
-                    print(f"Found potential users list in key: {key} with {len(data[key])} items")
-                    if "user" in key.lower():
-                        print(f"Using {key} as user list")
-                        users_data = data[key]
-        
-        # Process all users first to get their basic info and analyze them
-        all_users = []
-        
-        for i, user_item in enumerate(users_data):
-            print(f"\n==== USER ITEM {i} ====")
-            
-            # Handle different response formats
-            user = None
-            if isinstance(user_item, dict):
-                if "user_info" in user_item:
-                    user = user_item.get("user_info", {})
-                    print(f"Found user_info in user_item")
-                else:
-                    user = user_item  # Maybe the user data is directly in the item
-                    print(f"Using user_item directly as user")
-            
-            if not user:
-                print(f"User item {i} has no user data. Keys: {list(user_item.keys()) if isinstance(user_item, dict) else 'Not a dictionary'}")
-                continue
+        if response.status_code == 200:
+            data = response.json()
+            if data and "user_list" in data and data["user_list"]:
+                users = data["user_list"]
+                print(f"✅ SUCCESS: Found {len(users)} users via direct TikTok search")
                 
-            print(f"User keys: {list(user.keys())}")
+                for i, user in enumerate(users):
+                    if "user_info" in user:
+                        user_info = user["user_info"]
+                        username = user_info.get("unique_id", "")
+                        if username:
+                            # Calculate a relevance score based on follower count and verification
+                            follower_count = user_info.get("follower_count", 0)
+                            is_verified = user_info.get("custom_verify", "") != ""
+                            relevance = min(1.0, 0.5 + (0.3 if is_verified else 0) + min(0.2, follower_count / 1000000))
+                            
+                            # Create context text from user bio and stats
+                            bio = user_info.get("signature", "")
+                            followers = user_info.get("follower_count", 0)
+                            following = user_info.get("following_count", 0)
+                            likes = user_info.get("total_favorited", 0)
+                            context = f"Bio: {bio}\nFollowers: {followers}, Following: {following}, Likes: {likes}"
+                            
+                            usernames.append(TikTokUsername(
+                                username=username,
+                                source="TikTok Direct Search",
+                                context=context,
+                                search_relevance=relevance
+                            ))
+                            
+                            print(f"  {i+1}. @{username} (Relevance: {relevance:.2f})")
+                
+                return usernames[:max_results]
+            else:
+                print(f"⚠️ No users found in direct search response")
+        else:
+            print(f"❌ DIRECT SEARCH FAILED: HTTP {response.status_code}")
+        
+        return []
+        
+    except Exception as e:
+        print(f"❌ ERROR in direct TikTok search: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        return []
+
+async def search_for_tiktok_profiles(query: str, max_results: int = 10) -> List[TikTokUsername]:
+    """
+    Find TikTok profiles related to the query using multiple search strategies:
+    1. Direct TikTok search using ScrapTik API
+    2. Web search using Tavily API
+    
+    Args:
+        query: Search query
+        max_results: Maximum number of profiles to return
+        
+    Returns:
+        List of TikTok usernames with context
+    """
+    try:
+        print(f"\n==== SEARCHING FOR TIKTOK PROFILES ====\nQuery: {query}")
+        
+        all_usernames = []
+        username_set = set()  # Avoid duplicates
+        
+        # STRATEGY 1: Try direct TikTok search
+        direct_results = await search_directly_on_tiktok(query, max_results=max_results)
+        if direct_results:
+            print(f"✅ Found {len(direct_results)} usernames through direct TikTok search")
+            for username_obj in direct_results:
+                if username_obj.username not in username_set:
+                    username_set.add(username_obj.username)
+                    all_usernames.append(username_obj)
+        
+        # STRATEGY 2: Execute Tavily web search if we need more results
+        if len(all_usernames) < max_results:
+            more_needed = max_results - len(all_usernames)
+            print(f"🔍 STRATEGY 2: Tavily web search for {more_needed} more profiles")
+            tavily_results = perform_tavily_search(query, max_results=15)
             
-            # Check if required fields exist to avoid empty usernames
-            username_field = None
-            for field in ["uniqueId", "unique_id", "username", "name"]:
-                if field in user:
-                    username_field = field
-                    print(f"Found username in field: {field} = {user.get(field)}")
+            if not tavily_results or 'results' not in tavily_results or not tavily_results['results']:
+                print(f"❌ No Tavily results found for query: {query}")
+            else:
+                result_count = len(tavily_results['results'])
+                print(f"✅ Got {result_count} results from Tavily")
+                
+                # Process search results
+                for item in tavily_results['results']:
+                    title = item.get('title', '')
+                    url = item.get('url', '')
+                    content = item.get('content', '')
+                    snippet = item.get('snippet', '')
+                    
+                    # Combine all content for better extraction
+                    full_content = f"{title}\n{snippet}\n{content}"
+                    
+                    # Extract usernames
+                    usernames = extract_tiktok_usernames(url, title, full_content)
+                    
+                    # Add each username to results
+                    for username in usernames:
+                        if username and username not in username_set:
+                            username_set.add(username)
+                            all_usernames.append(TikTokUsername(
+                                username=username,
+                                source=url,
+                                context=snippet or content[:200]
+                            ))
+                    
+                    # Check if we have enough
+                    if len(all_usernames) >= max_results:
+                        break
+        
+        # Score usernames for relevance if they don't already have scores
+        usernames_to_score = [u for u in all_usernames if u.search_relevance is None]
+        if usernames_to_score:
+            print(f"Scoring relevance for {len(usernames_to_score)} usernames")
+            scored_usernames = await score_usernames_relevance(usernames_to_score, query)
+            
+            # Update scores in original list
+            for i, username in enumerate(all_usernames):
+                if username.search_relevance is None:
+                    username.search_relevance = scored_usernames[0].search_relevance
+                    scored_usernames.pop(0)
+        
+        # Sort by relevance and return
+        all_usernames.sort(key=lambda x: x.search_relevance or 0, reverse=True)
+        final_results = all_usernames[:max_results]
+        
+        print(f"📊 FINAL RESULTS: {len(final_results)} TikTok profiles found")
+        for i, username in enumerate(final_results):
+            print(f"  {i+1}. @{username.username} (Source: {username.source}, Relevance: {username.search_relevance or 0:.2f})")
+        
+        return final_results
+        
+    except Exception as e:
+        print(f"Error in search_for_tiktok_profiles: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        return []
+
+#-----------------------------------------------------------------------------
+# TikTok API Integration
+#-----------------------------------------------------------------------------
+
+async def get_user_by_username(username: str) -> Optional[Dict]:
+    """
+    Fetch TikTok user details by username using multiple endpoints in sequence
+    
+    Args:
+        username: TikTok username
+        
+    Returns:
+        User data from ScrapTik API or minimal placeholder data if not found
+    """
+    try:
+        print(f"\n🔍 FETCHING USER DATA FOR: @{username}")
+        print(f"API Key Status: {'✓ Set' if RAPID_API_KEY else '✗ Missing'}")
+        
+        # Try multiple approaches with a sequence of endpoints
+        max_retries = 3  # Per endpoint
+        backoff_time = 2
+        
+        # Track if we need to search for the user
+        user_needs_search = True
+        user_data = None
+        
+        # APPROACH 1: Try direct user-info endpoint with username
+        if user_needs_search:
+            print(f"🔎 APPROACH 1: Direct user-info lookup for @{username}")
+            retry_count = 0
+            
+            while retry_count < max_retries and user_needs_search:
+                try:
+                    url = ENDPOINTS["user_info"]
+                    params = {"unique_id": username}
+                    print(f"Request: GET {url} with params {params}")
+                    
+                    response = requests.get(url, headers=headers, params=params, timeout=10)
+                    print(f"Response Status: {response.status_code}")
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data and "user" in data:
+                            print(f"✅ SUCCESS: Direct user-info found @{username}")
+                            user_data = data["user"]
+                            user_needs_search = False
+                            print(f"Display Name: {user_data.get('nickname', 'Unknown')}")
+                            print(f"Follower Count: {user_data.get('follower_count', 'Unknown')}")
+                            return user_data
+                    
+                    # If rate limited, backoff and retry
+                    if response.status_code == 429:
+                        retry_count += 1
+                        wait_time = backoff_time * (2 ** retry_count)  # Exponential backoff
+                        print(f"⏱️ Rate limited. Retrying...")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        break
+                        
+                except requests.exceptions.ReadTimeout:
+                    # Timeouts are common with this API - don't flood logs
+                    retry_count += 1
+                    if retry_count == max_retries:
+                        print(f"⏱️ API timeouts for @{username}, moving to next approach")
+                    await asyncio.sleep(backoff_time * retry_count)  # Simple backoff
+                except Exception as e:
+                    # Only log first error, not each retry
+                    if retry_count == 0:
+                        print(f"⚠️ Error in Approach 1: {type(e).__name__}")
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        await asyncio.sleep(backoff_time * retry_count)
+                    else:
+                        break
+        
+        # APPROACH 2: Try the web/get-user endpoint
+        if user_needs_search:
+            print(f"🔎 APPROACH 2: Web user lookup for @{username}")
+            retry_count = 0
+            timeout_occurred = False
+            
+            while retry_count < max_retries and user_needs_search:
+                try:
+                    url = ENDPOINTS["web_user"]
+                    params = {"username": username}
+                    
+                    response = requests.get(url, headers=headers, params=params, timeout=10)
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data and "userInfo" in data:
+                            print(f"✅ SUCCESS: Web user lookup found @{username}")
+                            
+                            # Convert web user format to standard format
+                            user_info = data["userInfo"]
+                            user_data = {
+                                "nickname": user_info.get("user", {}).get("nickname", username),
+                                "signature": user_info.get("user", {}).get("signature", "No bio available"),
+                                "follower_count": user_info.get("stats", {}).get("followerCount", 0),
+                                "avatar_larger": {"url_list": [user_info.get("user", {}).get("avatarLarger", "")]},
+                                "uid": user_info.get("user", {}).get("id", "")
+                            }
+                            
+                            user_needs_search = False
+                            print(f"Display Name: {user_data.get('nickname', 'Unknown')}")
+                            print(f"Follower Count: {user_data.get('follower_count', 'Unknown')}")
+                            return user_data
+                
+                    # If rate limited, backoff and retry
+                    if response.status_code == 429:
+                        retry_count += 1
+                        await asyncio.sleep(backoff_time * retry_count)
+                    else:
+                        # Try next approach
+                        break
+                        
+                except requests.exceptions.ReadTimeout:
+                    # Timeouts are common with this API - don't flood logs
+                    timeout_occurred = True
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        await asyncio.sleep(backoff_time * retry_count)
+                    else:
+                        break
+                except Exception as e:
+                    # Only log first error, not repetitive ones
+                    if retry_count == 0:
+                        print(f"⚠️ Error: {type(e).__name__}")
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        await asyncio.sleep(backoff_time * retry_count)
+                    else:
+                        break
+                    
+            # Only log timeout once after all retries
+            if timeout_occurred and retry_count >= max_retries:
+                print(f"Error in Approach 2: Read timed out")
+        
+        # APPROACH 3: Try search-users endpoint to find the user
+        if user_needs_search:
+            print(f"🔎 APPROACH 3: Search users for @{username}")
+            retry_count = 0
+            
+            while retry_count < max_retries and user_needs_search:
+                try:
+                    url = ENDPOINTS["search_users"]
+                    # Search directly for the username as keyword
+                    params = {"keyword": username, "count": "5", "cursor": "0"}
+                    
+                    print(f"Request: GET {url} with params {params}")
+                    response = requests.get(url, headers=headers, params=params, timeout=15)
+                    print(f"Response Status: {response.status_code}")
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data and "user_list" in data:
+                            users = data["user_list"]
+                            
+                            # Look for exact username match first
+                            for user in users:
+                                if "user_info" in user and user["user_info"].get("unique_id", "").lower() == username.lower():
+                                    print(f"✅ SUCCESS: Found exact username match in search results")
+                                    # Convert to standard format
+                                    user_info = user["user_info"]
+                                    user_data = {
+                                        "nickname": user_info.get("nickname", username),
+                                        "signature": user_info.get("signature", "No bio available"),
+                                        "follower_count": user_info.get("follower_count", 0),
+                                        "avatar_larger": {"url_list": [user_info.get("avatar_larger", "")]},
+                                        "uid": user_info.get("uid", "")
+                                    }
+                                    user_needs_search = False
+                                    print(f"Display Name: {user_data.get('nickname', 'Unknown')}")
+                                    print(f"Follower Count: {user_data.get('follower_count', 'Unknown')}")
+                                    return user_data
+                            
+                            # If no exact match but we have results, take the top one
+                            if users and not user_data:
+                                print(f"✅ SUCCESS: Using top search result for @{username}")
+                                user = users[0]
+                                if "user_info" in user:
+                                    # Convert to standard format
+                                    user_info = user["user_info"]
+                                    user_data = {
+                                        "nickname": user_info.get("nickname", username),
+                                        "signature": user_info.get("signature", "No bio available"),
+                                        "follower_count": user_info.get("follower_count", 0),
+                                        "avatar_larger": {"url_list": [user_info.get("avatar_larger", "")]},
+                                        "uid": user_info.get("uid", "")
+                                    }
+                                    user_needs_search = False
+                                    print(f"Display Name: {user_data.get('nickname', 'Unknown')}")
+                                    print(f"Follower Count: {user_data.get('follower_count', 'Unknown')}")
+                                    print(f"Note: This is the closest match, not an exact username match")
+                                    return user_data
+                    
+                    # If rate limited, backoff and retry
+                    if response.status_code == 429:
+                        retry_count += 1
+                        wait_time = backoff_time * retry_count
+                        print(f"⚠️ RATE LIMITED: Waiting {wait_time}s before retry {retry_count}/{max_retries}")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        # Try next approach
+                        break
+                        
+                except Exception as e:
+                    print(f"Error in Approach 3: {str(e)}")
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        await asyncio.sleep(backoff_time * retry_count)
+                    else:
+                        break
+        
+        # APPROACH 4: Alternative API provider's user info endpoint
+        if user_needs_search:
+            print(f"🔎 APPROACH 4: Alternative API provider for @{username}")
+            retry_count = 0
+            
+            while retry_count < max_retries and user_needs_search:
+                try:
+                    url = f"{BASE_URL_ALTERNATIVE}/user/info"
+                    params = {"unique_id": username}
+                    
+                    print(f"Request: GET {url} with params {params}")
+                    response = requests.get(url, headers=headers_alternative, params=params, timeout=12)
+                    print(f"Response Status: {response.status_code}")
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data and "user" in data:
+                            print(f"✅ SUCCESS: Alternative API found @{username}")
+                            user_data = data["user"]
+                            user_needs_search = False
+                            print(f"Display Name: {user_data.get('nickname', 'Unknown')}")
+                            print(f"Follower Count: {user_data.get('follower_count', 'Unknown')}")
+                            return user_data
+                    
+                    # If rate limited, backoff and retry
+                    if response.status_code == 429:
+                        retry_count += 1
+                        wait_time = backoff_time * retry_count
+                        print(f"⚠️ RATE LIMITED: Waiting {wait_time}s before retry {retry_count}/{max_retries}")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        # Last approach failed
+                        break
+                        
+                except Exception as e:
+                    print(f"Error in Approach 4: {str(e)}")
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        await asyncio.sleep(backoff_time * retry_count)
+                    else:
+                        break
+        
+        # FALLBACK: Create minimal user object if all approaches failed
+        if user_needs_search:
+            print(f"🔄 CREATING MINIMAL USER OBJECT for @{username} after all approaches failed")
+            return {
+                "nickname": username,
+                "signature": "Profile information not available",
+                "follower_count": 0,
+                "avatar_larger": {"url_list": [""]},
+                "uid": ""
+            }
+    
+    except Exception as e:
+        print(f"❌ ERROR: {type(e).__name__} when fetching @{username}")
+        # Last resort: Create a minimal user object even after fatal error
+        return {
+            "nickname": username,
+            "signature": "Profile information not available",
+            "follower_count": 0,
+            "avatar_larger": {"url_list": [""]},
+            "uid": ""
+        }
+
+async def get_user_videos(user_id: str, count: int = 3) -> List[Dict]:
+    """
+    Get recent videos for a user using multiple endpoints
+    
+    Args:
+        user_id: TikTok user ID
+        count: Number of videos to return
+        
+    Returns:
+        List of video data
+    """
+    try:
+        print(f"🎥 FETCHING VIDEOS for user_id: {user_id}")
+        
+        # Try multiple approaches to fetch videos
+        max_retries = 2  # Per endpoint
+        backoff_time = 2
+        
+        # APPROACH 1: Use standard user-posts endpoint
+        print(f"🔎 APPROACH 1: Standard user-posts endpoint")
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                url = ENDPOINTS["user_posts"]
+                params = {
+                    "user_id": user_id,
+                    "count": str(count),
+                    "max_cursor": "0"
+                }
+                
+                print(f"Request: GET {url} with params {params}")
+                response = requests.get(url, headers=headers, params=params, timeout=12)
+                print(f"Response Status: {response.status_code}")
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    if "aweme_list" in data and data["aweme_list"]:
+                        video_count = len(data["aweme_list"])
+                        print(f"✅ SUCCESS: Retrieved {video_count} videos using standard endpoint")
+                        return data["aweme_list"]
+                    else:
+                        print("⚠️ No videos found in standard endpoint response")
+                
+                # If rate limited, backoff and retry
+                if response.status_code == 429:
+                    retry_count += 1
+                    wait_time = backoff_time * retry_count
+                    print(f"⚠️ RATE LIMITED: Waiting {wait_time}s before retry")
+                    await asyncio.sleep(wait_time)
+                else:
+                    # Try next approach if this one didn't work
                     break
                     
-            if not username_field:
-                print(f"User {i} missing username field. Available keys: {list(user.keys())}")
-                continue
-            
-            # Determine appropriate field names
-            follower_field = next((f for f in ["followerCount", "follower_count", "fans"] if f in user), None)
-            following_field = next((f for f in ["followingCount", "following_count", "following"] if f in user), None)
-            likes_field = next((f for f in ["heartCount", "heart_count", "likes", "digg_count", "hearts", "total_favorited", "heart", "favorited_count", "total_hearts"] if f in user), None)
-            display_name_field = next((f for f in ["nickname", "display_name", "name"] if f in user), None)
-            bio_field = next((f for f in ["signature", "bio", "description"] if f in user), None)
-            verify_field = next((f for f in ["verified", "is_verified"] if f in user), None)
-            avatar_field = next((f for f in ["avatarMedium", "avatar_medium", "avatar", "avatar_url"] if f in user), None)
-            
-            # Add debug logging specifically for likes
-            print(f"Looking for likes field. Available fields: {list(user.keys())}")
-            print(f"Found likes_field: {likes_field}")
-            if likes_field:
-                print(f"Likes value: {user.get(likes_field)}")
-            
-            # Try to find likes in a stats object if present
-            likes_count = 0
-            if likes_field:
-                likes_count = user.get(likes_field, 0)
-            elif "stats" in user and isinstance(user["stats"], dict):
-                stats = user["stats"]
-                print(f"Found stats object with keys: {list(stats.keys())}")
-                for potential_field in ["heartCount", "heart_count", "likes", "digg_count", "hearts", "total_favorited", "heart", "favorited_count", "total_hearts", "diggCount"]:
-                    if potential_field in stats:
-                        likes_count = stats[potential_field]
-                        print(f"Found likes in stats.{potential_field}: {likes_count}")
-                        break
-            # Check if there's a direct counts field
-            elif "counts" in user and isinstance(user["counts"], dict):
-                counts = user["counts"]
-                print(f"Found counts object with keys: {list(counts.keys())}")
-                for potential_field in ["likes", "hearts", "heart", "digg", "total_favorited", "favorited_count", "total_hearts"]:
-                    if potential_field in counts:
-                        likes_count = counts[potential_field]
-                        print(f"Found likes in counts.{potential_field}: {likes_count}")
-                        break
-            
-            # Add one more check for direct stats fields at root level
-            if likes_count == 0:
-                for potential_field in ["heartCount", "heart_count", "diggCount", "digg_count", "hearts", "total_favorited"]:
-                    if potential_field in user:
-                        likes_count = user.get(potential_field, 0)
-                        print(f"Found likes directly in user.{potential_field}: {likes_count}")
-                        break
-            
-            # Get profile picture as base64
-            profile_pic_base64 = None
-            if avatar_field and user.get(avatar_field):
-                print(f"Getting profile picture from {avatar_field}: {user.get(avatar_field)}")
-                profile_pic_base64 = get_image_as_base64(user.get(avatar_field))
-            
-            # Basic user information - create the user object regardless of criteria matching
-            # We'll filter by criteria later after analyzing relevance
-            tiktok_user = TikTokUser(
-                id=user.get("uid", user.get("id", "")),
-                username=user.get(username_field, ""),
-                display_name=user.get(display_name_field, "Unknown") if display_name_field else "Unknown",
-                bio=user.get(bio_field, "") if bio_field else "",
-                follower_count=user.get(follower_field, 0) if follower_field else 0,
-                following_count=user.get(following_field, 0) if following_field else 0,
-                likes_count=likes_count,
-                verified=user.get(verify_field, False) if verify_field else False,
-                profile_pic=profile_pic_base64 or ""
-            )
-            
-            print(f"Created TikTokUser object with username: {tiktok_user.username}")
-            
-            # Perform basic analysis for all users
-            analysis_result = analyze_user_content(user, request.query)
-            tiktok_user.analysis_result = analysis_result
-            
-            # Add to all users list
-            all_users.append((tiktok_user, user))
-        
-        print(f"\n==== PROCESSED ALL USERS ====")
-        print(f"Processed {len(all_users)} users")
-        
-        # Now filter users by both criteria and relevance, and sort by relevance score
-        filtered_users = []
-        for tiktok_user, original_user in all_users:
-            # Check if user matches criteria
-            if does_user_match_criteria(original_user, request.criteria):
-                filtered_users.append(tiktok_user)
-        
-        print(f"Found {len(filtered_users)} users matching criteria")
-        
-        # Sort users by relevance score (highest first)
-        filtered_users.sort(key=lambda user: user.analysis_result.score if user.analysis_result else 0, reverse=True)
-        
-        # If we don't have enough users after filtering, we can consider lowering our criteria
-        if len(filtered_users) < min(5, request.count) and all_users:
-            print(f"Not enough users after filtering, considering users with lower relevance")
-            # Add users that might not match criteria but have high relevance
-            for tiktok_user, _ in all_users:
-                if tiktok_user not in filtered_users and tiktok_user.analysis_result and tiktok_user.analysis_result.score > 0.5:
-                    filtered_users.append(tiktok_user)
-                    if len(filtered_users) >= request.count:
-                        break
-        
-        # Return only the requested number of users
-        result_users = filtered_users[:request.count]
-        
-        # If deep analysis is requested and we have OpenAI API key, perform more detailed analysis for the top results
-        if request.deep_analysis and OPENAI_API_KEY and OPENAI_API_KEY != "YOUR_OPENAI_API_KEY_HERE":
-            # Schedule detailed analysis for top users as background tasks
-            pending_analyses = []
-            for i, (user, original_user) in enumerate([(u, ou) for u, ou in all_users if u in result_users]):
-                if i < min(len(result_users), 5):  # Limit deep analysis to top 5 results
-                    pending_analyses.append((original_user, i, request.query))
-                    
-            for original_user, index, query in pending_analyses:
-                if index < len(result_users):
-                    background_tasks.add_task(analyze_user_and_update, original_user, query, index, result_users)
-        
-        return result_users
-    except HTTPException:
-        raise
-    except Exception as e:
-        error_message = f"Internal server error: {str(e)}"
-        print(f"ERROR in search_users: {error_message}")
-        print(f"Exception type: {type(e).__name__}")
-        import traceback
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=error_message)
-
-def analyze_user_and_update(user, query, index, users_list):
-    """Analyze a user and update the results"""
-    analysis = analyze_user_content(user, query)
-    if index < len(users_list):
-        users_list[index].analysis_result = analysis
-
-@app.get("/user-details/{username}")
-async def get_user_details(username: str):
-    """Get detailed information about a specific TikTok user by username"""
-    try:
-        print(f"\n\n==== USER DETAILS REQUEST ====")
-        print(f"Username: {username}")
-        
-        url = f"{BASE_URL}/user-info"
-        params = {
-            "username": username
-        }
-        
-        print(f"\n==== MAKING API REQUEST ====")
-        print(f"URL: {url}")
-        print(f"Params: {params}")
-        print(f"Headers: X-RapidAPI-Key: {'*' * 5 + RAPID_API_KEY[-5:] if RAPID_API_KEY else 'Not set'}")
-        
-        response = requests.get(url, headers=headers, params=params)
-        
-        print(f"\n==== API RESPONSE ====")
-        print(f"Status Code: {response.status_code}")
-        print(f"Response Text Preview: {response.text[:200]}...")
-        
-        if response.status_code != 200:
-            error_detail = f"Error from ScrapTik API: {response.text}"
-            print(f"API Error: {error_detail}")
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=error_detail
-            )
-        
-        data = response.json()
-        
-        # Extract user information from the response
-        user_info = data.get("userInfo", {})
-        
-        if not user_info:
-            raise HTTPException(
-                status_code=404,
-                detail=f"User {username} not found"
-            )
-        
-        # Create a TikTokUser object
-        tiktok_user = TikTokUser(
-            id=user_info.get("user", {}).get("id", ""),
-            username=user_info.get("user", {}).get("uniqueId", username),
-            display_name=user_info.get("user", {}).get("nickname", "Unknown"),
-            bio=user_info.get("user", {}).get("signature", ""),
-            follower_count=user_info.get("stats", {}).get("followerCount", 0),
-            following_count=user_info.get("stats", {}).get("followingCount", 0),
-            likes_count=user_info.get("stats", {}).get("heartCount", 0),
-            verified=user_info.get("user", {}).get("verified", False),
-            profile_pic=user_info.get("user", {}).get("avatarLarger", "")
-        )
-        
-        return tiktok_user
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        error_message = f"Error getting user details: {str(e)}"
-        print(f"ERROR in get_user_details: {error_message}")
-        print(f"Exception type: {type(e).__name__}")
-        import traceback
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=error_message)
-
-@app.get("/user-info")
-async def get_user_info(user_id: str):
-    """Get detailed information about a specific TikTok user by ID"""
-    try:
-        url = f"{BASE_URL}/get-user-info"
-        params = {"user_id": user_id}
-        
-        response = requests.get(url, headers=headers, params=params)
-        
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=f"Error from ScrapTik API: {response.text}"
-            )
-        
-        return response.json()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-@app.get("/user-posts/{user_id}")
-async def get_user_posts(user_id: str, count: int = 5):
-    """Get recent posts from a specific TikTok user"""
-    try:
-        print(f"\n==== FETCHING USER POSTS ====")
-        print(f"User ID: {user_id}")
-        print(f"Count: {count}")
-        
-        url = f"{BASE_URL}/user-posts"
-        params = {
-            "user_id": user_id,
-            "count": count,
-            "max_cursor": "0"
-        }
-        
-        response = requests.get(url, headers=headers, params=params)
-        
-        if response.status_code != 200:
-            error_detail = f"Error from ScrapTik API: {response.text}"
-            print(f"API Error: {error_detail}")
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=error_detail
-            )
-            
-        return response.json()
-    except Exception as e:
-        error_message = f"Error fetching user posts: {str(e)}"
-        print(error_message)
-        raise HTTPException(status_code=500, detail=error_message)
-
-@app.get("/trending-creators")
-async def get_trending_creators(region: str = "US"):
-    """Get trending creators from TikTok"""
-    try:
-        print(f"\n==== FETCHING TRENDING CREATORS ====")
-        print(f"Region: {region}")
-        
-        url = f"{BASE_URL}/trending-creators"
-        params = {"region": region}
-        
-        response = requests.get(url, headers=headers, params=params)
-        
-        if response.status_code != 200:
-            error_detail = f"Error from ScrapTik API: {response.text}"
-            print(f"API Error: {error_detail}")
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=error_detail
-            )
-        
-        data = response.json()
-        
-        # Process the response to ensure likes count is available
-        if "user_list" in data and isinstance(data["user_list"], list):
-            for user_item in data["user_list"]:
-                # Process each user to extract likes count from different sources
-                user = user_item.get("user_info", user_item)
-                
-                # Find likes in different possible locations
-                if not any(field in user for field in ["heartCount", "heart_count", "diggCount", "digg_count"]):
-                    # Look for likes in stats
-                    if "stats" in user and isinstance(user["stats"], dict):
-                        stats = user["stats"]
-                        for src_field, dest_field in [
-                            ("heartCount", "heartCount"),
-                            ("heart_count", "heart_count"),
-                            ("diggCount", "diggCount"), 
-                            ("digg_count", "digg_count")
-                        ]:
-                            if src_field in stats:
-                                user[dest_field] = stats[src_field]
-                    
-                    # Look in counts
-                    elif "counts" in user and isinstance(user["counts"], dict):
-                        counts = user["counts"]
-                        for src_field, dest_field in [
-                            ("hearts", "heartCount"),
-                            ("heart", "heartCount"),
-                            ("digg", "diggCount"), 
-                            ("likes", "heartCount")
-                        ]:
-                            if src_field in counts:
-                                user[dest_field] = counts[src_field]
-        
-        return data
-    except Exception as e:
-        error_message = f"Error fetching trending creators: {str(e)}"
-        print(error_message)
-        raise HTTPException(status_code=500, detail=error_message)
-
-@app.get("/download-video")
-async def download_video(video_url: str):
-    """Download a TikTok video without watermark"""
-    try:
-        print(f"\n==== DOWNLOADING VIDEO ====")
-        print(f"Received video URL: {video_url}")
-        
-        # Handle invalid URL format
-        if not isinstance(video_url, str) or video_url == '[object Object]':
-            raise HTTPException(
-                status_code=400, 
-                detail="Invalid video URL format. Received: " + str(video_url)
-            )
-            
-        # If URL is already a CDN URL, just return it directly
-        if "tiktokcdn" in video_url:
-            print("Direct CDN URL detected, returning it directly")
-            return {"url": video_url, "source": "direct_cdn"}
-            
-        # Clean the URL if it has query parameters or extra data
-        if "?" in video_url:
-            video_url = video_url.split("?")[0]
-            
-        if not (video_url.startswith("http://") or video_url.startswith("https://")):
-            if "tiktok.com" in video_url:
-                video_url = "https://" + video_url
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid URL format: {video_url}"
-                )
-        
-        # Handle TikTok shortlinks
-        if "vm.tiktok.com" in video_url or "vt.tiktok.com" in video_url:
-            print("Converting TikTok shortlink to full URL")
-            try:
-                # Follow the redirect to get the full URL
-                redirect_session = requests.Session()
-                redirect_response = redirect_session.head(video_url, allow_redirects=True, timeout=5)
-                if redirect_response.url and "tiktok.com" in redirect_response.url:
-                    video_url = redirect_response.url
-                    print(f"Converted to: {video_url}")
-            except requests.exceptions.Timeout:
-                print("Timeout when following shortlink redirect")
             except Exception as e:
-                print(f"Error following shortlink: {str(e)}")
+                print(f"Error in Approach 1: {type(e).__name__}")
+                retry_count += 1
+                if retry_count < max_retries:
+                    await asyncio.sleep(backoff_time * retry_count)
+                else:
+                    break
         
-        # Try direct extraction first (faster and more reliable)
-        try:
-            print("Attempting direct extraction...")
-            # Get TikTok page content
-            tiktok_response = requests.get(video_url, timeout=10)
-            if tiktok_response.status_code == 200:
-                # Look for video URL in page source
-                video_content = tiktok_response.text
-                # Try to extract the video URL with a basic regex pattern
-                import re
-                video_url_match = re.search(r'{"playAddr":"([^"]+)"', video_content) or \
-                                re.search(r'playAddr":"([^"]+)"', video_content) or \
-                                re.search(r'"playAddr":{"uri":"([^"]+)"', video_content) or \
-                                re.search(r'"playAddr":"([^"]+)"', video_content) or \
-                                re.search(r'<video[^>]*src=["\']([^"\']+)["\']', video_content)
-                
-                if video_url_match:
-                    direct_url = video_url_match.group(1).replace('\\u002F', '/').replace('\\/', '/')
-                    print(f"Direct extraction successful: {direct_url[:50]}...")
-                    return {"url": direct_url, "source": "direct_extraction"}
-        except requests.exceptions.Timeout:
-            print("Direct extraction timed out")
-        except Exception as e:
-            print(f"Direct extraction failed: {str(e)}")
-        
-        # Try using the scraptik API with timeout
-        print("Trying ScrapTik API...")
-        
-        # Use the API key from the request to properly authenticate
-        api_key = RAPID_API_KEY
-        if not api_key:
-            raise HTTPException(
-                status_code=500,
-                detail="API key is not configured"
-            )
-        
-        url = f"{BASE_URL}/video-without-watermark"
-        params = {"url": video_url}
-        api_headers = {
-            "X-RapidAPI-Key": api_key,
-            "X-RapidAPI-Host": "scraptik.p.rapidapi.com"
-        }
+        # APPROACH 2: Use search keyword with the user ID to find videos
+        print(f"🔎 APPROACH 2: Search posts endpoint with user ID")
+        retry_count = 0
         
         try:
-            response = requests.get(url, headers=api_headers, params=params, timeout=15)
-            
-            if response.status_code != 200:
-                error_detail = f"Error from ScrapTik API: {response.text[:200]}"
-                print(f"API Error: {error_detail}")
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=error_detail
-                )
-                
-            result = response.json()
-            print(f"ScrapTik response keys: {list(result.keys())}")
-            
-            # Check different possible response structures
-            if "play_url" in result:
-                return {"url": result["play_url"], "source": "scraptik"}
-            elif "url" in result:
-                return {"url": result["url"], "source": "scraptik"}
-            elif "data" in result and isinstance(result["data"], dict):
-                data = result["data"]
-                if "play_url" in data:
-                    return {"url": data["play_url"], "source": "scraptik_data"}
-                elif "url" in data:
-                    return {"url": data["url"], "source": "scraptik_data"}
-            
-            # No valid URL found in response
-            raise HTTPException(
-                status_code=404,
-                detail="No video URL found in the API response"
-            )
-        except requests.exceptions.Timeout:
-            raise HTTPException(
-                status_code=504,
-                detail="ScrapTik API request timed out"
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error with ScrapTik API: {str(e)}"
-            )
-                
-    except HTTPException:
-        raise
-    except Exception as e:
-        error_message = f"Error downloading video: {str(e)}"
-        print(error_message)
-        import traceback
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=error_message)
-
-@app.post("/search-posts")
-async def search_posts(request: PostSearchRequest):
-    """Search for TikTok posts based on keyword and filters"""
-    try:
-        print(f"\n\n==== POST SEARCH REQUEST ====")
-        print(f"Keyword: {request.keyword}")
-        print(f"Count: {request.count}")
-        print(f"Offset: {request.offset}")
-        print(f"Use Filters: {request.use_filters}")
-        print(f"Publish Time: {request.publish_time}")
-        print(f"Sort Type: {request.sort_type}")
-        
-        url = f"{BASE_URL}/search-posts"
-        params = {
-            "keyword": request.keyword,
-            "count": request.count,
-            "offset": request.offset,
-            "use_filters": request.use_filters,
-            "publish_time": request.publish_time,
-            "sort_type": request.sort_type
-        }
-        
-        print(f"\n==== MAKING API REQUEST ====")
-        print(f"URL: {url}")
-        print(f"Params: {params}")
-        print(f"Headers: X-RapidAPI-Key: {'*' * 5 + RAPID_API_KEY[-5:] if RAPID_API_KEY else 'Not set'}")
-        
-        response = requests.get(url, headers=headers, params=params)
-        
-        print(f"\n==== API RESPONSE ====")
-        print(f"Status Code: {response.status_code}")
-        print(f"Response Text Preview: {response.text[:200]}...")
-        
-        if response.status_code != 200:
-            error_detail = f"Error from ScrapTik API: {response.text}"
-            print(f"API Error: {error_detail}")
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=error_detail
-            )
-        
-        data = response.json()
-        
-        # Process the response if needed
-        print(f"\n==== PARSED RESPONSE ====")
-        print(f"Response Type: {type(data)}")
-        print(f"API Response Keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dictionary'}")
-        
-        # Create a result container for posts
-        processed_posts = []
-        
-        # Check for posts list in the response
-        if "aweme_list" in data and isinstance(data["aweme_list"], list) and len(data["aweme_list"]) > 0:
-            posts = data["aweme_list"]
-            print(f"Found {len(posts)} posts in aweme_list")
-            processed_posts = posts
-            
-        # If aweme_list is empty, check for search_item_list
-        elif "search_item_list" in data and isinstance(data["search_item_list"], list) and len(data["search_item_list"]) > 0:
-            search_items = data["search_item_list"]
-            print(f"Found {len(search_items)} posts in search_item_list")
-            
-            # Extract aweme_info from each search item
-            for item in search_items:
-                if "aweme_info" in item and isinstance(item["aweme_info"], dict):
-                    processed_posts.append(item["aweme_info"])
-        
-        print(f"Processed {len(processed_posts)} total posts")
-        
-        # Enrich post data if needed
-        for post in processed_posts:
-            # Add profile pics for authors if available
-            if "author" in post and "avatar_thumb" in post["author"]:
-                avatar_url = post["author"]["avatar_thumb"].get("url_list", [])
-                if avatar_url and len(avatar_url) > 0:
-                    post["author"]["avatar_base64"] = get_image_as_base64(avatar_url[0])
-        
-        # Return our processed data
-        result = {
-            "aweme_list": processed_posts,
-            "has_more": data.get("has_more", 0),
-            "cursor": data.get("cursor", 0)
-        }
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        error_message = f"Error searching posts: {str(e)}"
-        print(f"ERROR in search_posts: {error_message}")
-        print(f"Exception type: {type(e).__name__}")
-        import traceback
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=error_message)
-
-# Add a new endpoint for deep content analysis
-@app.post("/analyze-content")
-async def analyze_content(request: ContentAnalysisRequest):
-    """Perform deeper content analysis on a specific user"""
-    try:
-        print(f"\n\n==== CONTENT ANALYSIS REQUEST ====")
-        print(f"User ID: {request.user_id}")
-        print(f"Query: {request.query}")
-        
-        # First try getting user details by ID
-        try:
-            url = f"{BASE_URL}/get-user-info"
-            params = {"user_id": request.user_id}
-            
-            user_response = requests.get(url, headers=headers, params=params)
-            if user_response.status_code == 200:
-                user_data = user_response.json()
-            else:
-                # Fallback to user-posts to get basic info
-                print(f"Failed to get user details, falling back to user posts data")
-                user_data = {
-                    "uid": request.user_id,
-                    "id": request.user_id
-                }
-        except Exception as e:
-            print(f"Error getting user info: {str(e)}")
-            user_data = {
-                "uid": request.user_id,
-                "id": request.user_id
+            # First try to get videos through search
+            url = f"{BASE_URL}/search-posts"
+            params = {
+                "keyword": f"user:{user_id}",  # Using user ID as keyword
+                "count": str(count),
+                "offset": "0"
             }
             
-        # Then get user posts to analyze thumbnails and get more user data
-        posts_url = f"{BASE_URL}/user-posts"
-        posts_params = {
-            "user_id": request.user_id,
-            "count": 3,  # Get a few posts for thumbnail analysis
-            "max_cursor": "0"
-        }
-        
-        posts_response = requests.get(posts_url, headers=headers, params=posts_params)
-        if posts_response.status_code == 200:
-            posts_data = posts_response.json()
+            print(f"Request: GET {url} with params {params}")
+            response = requests.get(url, headers=headers, params=params, timeout=15)
+            print(f"Response Status: {response.status_code}")
             
-            # Extract author info from posts if it exists
-            if "aweme_list" in posts_data and isinstance(posts_data["aweme_list"], list) and len(posts_data["aweme_list"]) > 0:
-                # Add post data to user for thumbnail analysis
-                user_data["aweme_list"] = posts_data["aweme_list"]
+            if response.status_code == 200:
+                data = response.json()
+                if data and "aweme_list" in data and data["aweme_list"]:
+                    videos = data["aweme_list"]
+                    print(f"✅ SUCCESS: Found {len(videos)} videos through search posts")
+                    return videos
                 
-                # Get author data if not available from user-info
-                if "author" in posts_data["aweme_list"][0]:
-                    author = posts_data["aweme_list"][0]["author"]
-                    for key, value in author.items():
-                        if key not in user_data:
-                            user_data[key] = value
+        except Exception as e:
+            print(f"Error in Approach 2: {type(e).__name__}")
         
-        # Perform deep analysis
+        # APPROACH 3: Try the alternative API provider
+        print(f"🔎 APPROACH 3: Alternative API provider")
+        
         try:
-            analysis_result = analyze_user_content(user_data, request.query)
-            
-            return {
-                "user_id": request.user_id,
-                "query": request.query,
-                "analysis": analysis_result,
-                "status": "success"
-            }
-
-        except openai.error.RateLimitError:
-            print("⚠️ OpenAI API quota exceeded - using basic matching")
-            # Fall back to a basic analysis
-            return {
-                "user_id": request.user_id,
-                "query": request.query,
-                "analysis": AnalysisResult(
-                    relevant=True,
-                    score=0.6,
-                    explanation="OpenAI API quota exceeded. Using basic keyword matching instead.\n\nThis account appears to have some relevance to your search based on keywords in their profile.",
-                    image_analysis="OpenAI API quota exceeded",
-                    thumbnail_analysis="OpenAI API quota exceeded"
-                ),
-                "status": "limited"
+            alt_url = f"{BASE_URL_ALTERNATIVE}/user/posts"
+            alt_params = {
+                "user_id": user_id,
+                "count": str(count),
+                "cursor": "0"
             }
             
+            print(f"Request: GET {alt_url} with params {alt_params}")
+            alt_response = requests.get(alt_url, headers=headers_alternative, params=alt_params, timeout=12)
+            print(f"Response Status: {alt_response.status_code}")
+            
+            if alt_response.status_code == 200:
+                alt_data = alt_response.json()
+                if "aweme_list" in alt_data and alt_data["aweme_list"]:
+                    videos = alt_data["aweme_list"]
+                    print(f"✅ SUCCESS: Retrieved {len(videos)} videos using alternative API")
+                    return videos
+                
+        except Exception as e:
+            print(f"Error in Approach 3: {type(e).__name__}")
+        
+        # If all approaches failed, return empty list
+        print(f"❌ ALL APPROACHES FAILED: Unable to fetch videos for user_id {user_id}")
+        return []
+        
     except Exception as e:
-        error_message = f"Error analyzing content: {str(e)}"
-        print(f"ERROR in analyze_content: {error_message}")
-        print(f"Exception type: {type(e).__name__}")
-        import traceback
-        print(traceback.format_exc())
-        
-        # Return a user-friendly error response
-        return {
-            "user_id": request.user_id,
-            "query": request.query,
-            "analysis": AnalysisResult(
-                relevant=True,
-                score=0.5,
-                explanation="Error occurred during analysis. Using basic matching instead.",
-                image_analysis="Analysis error",
-                thumbnail_analysis="Analysis error"
-            ),
-            "status": "error",
-            "error": error_message
-        }
+        print(f"❌ ERROR: {type(e).__name__} when fetching videos for user_id {user_id}")
+        return []
 
-# Add a new endpoint for smart-search
-@app.post("/smart-search")
-async def smart_search(request: SmartSearchRequest):
-    """Use AI to find specific TikTok users using natural language queries"""
+#-----------------------------------------------------------------------------
+# Helper Functions
+#-----------------------------------------------------------------------------
+
+def get_profile_pic_url(user_data: Dict) -> str:
+    """
+    Extract profile picture URL from TikTok user data
+    
+    Args:
+        user_data: User data from ScrapTik API
+        
+    Returns:
+        URL string to user's profile picture or empty string if not found
+    """
     try:
-        print(f"\n\n==== SMART SEARCH REQUEST ====")
-        print(f"Query: {request.query}")
+        # Check different avatar fields in order of preference
+        if "avatar_larger" in user_data:
+            # Handle both string and dictionary cases
+            if isinstance(user_data["avatar_larger"], str):
+                return user_data["avatar_larger"]
+            elif isinstance(user_data["avatar_larger"], dict) and "url_list" in user_data["avatar_larger"]:
+                urls = user_data["avatar_larger"]["url_list"]
+                if urls and isinstance(urls, list) and len(urls) > 0:
+                    return urls[0] if isinstance(urls[0], str) else ""
         
-        # First, ask OpenAI to help find what specific username to search for
-        system_prompt = """
-        You are a helpful assistant to identify specific TikTok creators from natural language descriptions.
-        Your task is to understand what kind of TikTok user the person is looking for and suggest the most likely
-        username based on the description. If you can't determine a specific user, say so.
+        # Try avatar_medium next
+        if "avatar_medium" in user_data:
+            if isinstance(user_data["avatar_medium"], str):
+                return user_data["avatar_medium"]
+            elif isinstance(user_data["avatar_medium"], dict) and "url_list" in user_data["avatar_medium"]:
+                urls = user_data["avatar_medium"]["url_list"]
+                if urls and isinstance(urls, list) and len(urls) > 0:
+                    return urls[0] if isinstance(urls[0], str) else ""
         
-        For example:
-        - "Find Khaby Lame" -> username: "khaby.lame", confidence: 0.95
-        - "Find that doctor who explains medical concepts" -> username: "doctor.mike", confidence: 0.8
-        - "Find a cricket player who promotes cricket products" -> username: "cricketamz", confidence: 0.7
+        # Try avatar_thumb as fallback
+        if "avatar_thumb" in user_data:
+            if isinstance(user_data["avatar_thumb"], str):
+                return user_data["avatar_thumb"]
+            elif isinstance(user_data["avatar_thumb"], dict) and "url_list" in user_data["avatar_thumb"]:
+                urls = user_data["avatar_thumb"]["url_list"]
+                if urls and isinstance(urls, list) and len(urls) > 0:
+                    return urls[0] if isinstance(urls[0], str) else ""
         
-        Respond with JSON only in this format:
+        # Try direct avatar field
+        if "avatar" in user_data and isinstance(user_data["avatar"], str):
+            return user_data["avatar"]
+            
+        # If all those fail, see if there's a raw avatar URL
+        if "avatar_url" in user_data and isinstance(user_data["avatar_url"], str):
+            return user_data["avatar_url"]
+        
+        # Return empty string if nothing found
+        print(f"No profile picture URL found for user")
+        return ""
+        
+    except Exception as e:
+        print(f"Error extracting profile picture URL: {type(e).__name__}")
+        return ""
+
+def get_video_thumbnail(video_data: Dict) -> str:
+    """
+    Extract thumbnail URL from TikTok video data
+    
+    Args:
+        video_data: Video data from ScrapTik API
+        
+    Returns:
+        URL string to video thumbnail or empty string if not found
+    """
+    try:
+        # Handle various thumbnail formats with better error handling
+        # Check different thumbnail fields in order of preference
+        if "cover" in video_data:
+            # Handle both string and dictionary cases
+            if isinstance(video_data["cover"], str):
+                return video_data["cover"]
+            elif isinstance(video_data["cover"], dict) and "url_list" in video_data["cover"]:
+                urls = video_data["cover"]["url_list"]
+                if urls and isinstance(urls, list) and len(urls) > 0:
+                    return urls[0] if isinstance(urls[0], str) else ""
+        
+        # Try origin_cover next
+        if "origin_cover" in video_data:
+            if isinstance(video_data["origin_cover"], str):
+                return video_data["origin_cover"]
+            elif isinstance(video_data["origin_cover"], dict) and "url_list" in video_data["origin_cover"]:
+                urls = video_data["origin_cover"]["url_list"]
+                if urls and isinstance(urls, list) and len(urls) > 0:
+                    return urls[0] if isinstance(urls[0], str) else ""
+        
+        # Try thumbnail as fallback
+        if "thumbnail" in video_data:
+            if isinstance(video_data["thumbnail"], str):
+                return video_data["thumbnail"]
+            elif isinstance(video_data["thumbnail"], dict) and "url_list" in video_data["thumbnail"]:
+                urls = video_data["thumbnail"]["url_list"]
+                if urls and isinstance(urls, list) and len(urls) > 0:
+                    return urls[0] if isinstance(urls[0], str) else ""
+                    
+        # Try direct thumbnail field
+        if "thumbnail_url" in video_data and isinstance(video_data["thumbnail_url"], str):
+            return video_data["thumbnail_url"]
+        
+        # Return empty string if nothing found
+        print(f"No thumbnail URL found for video")
+        return ""
+    except Exception as e:
+        print(f"Error getting thumbnail URL: {type(e).__name__}")
+        return ""
+
+#-----------------------------------------------------------------------------
+# OpenAI Integration
+#-----------------------------------------------------------------------------
+
+async def score_usernames_relevance(usernames: List[TikTokUsername], query: str) -> List[TikTokUsername]:
+    """
+    Score the relevance of usernames to the search query using GPT
+    
+    Args:
+        usernames: List of TikTok usernames
+        query: Original search query
+        
+    Returns:
+        List of usernames with relevance scores
+    """
+    try:
+        # If only a few usernames, give them high scores
+        if len(usernames) <= 3:
+            for username in usernames:
+                username.search_relevance = 0.9
+            return usernames
+            
+        # Skip scoring for efficiency if many usernames
+        if len(usernames) > 20:
+            # Just give them all medium scores
+            for username in usernames:
+                username.search_relevance = 0.7
+            return usernames
+        
+        # Prepare scoring prompt
+        # Format the query to be more specific for finding exact users
+        formattedQuery = f"Find the exact TikTok username for: {query}. If you know the exact username, return it. If not, say 'No specific user found'"
+        
+        system_prompt = """You are an expert at determining the relevance of TikTok usernames to search queries.
+        Rate each username based on how likely it is to be relevant to the query. Consider username patterns, 
+        context, and source URL. Rate on a scale from 0 to 1, where 1 is highly relevant."""
+        
+        user_prompt = f"""Query: {formattedQuery}
+
+        Please rate these TikTok usernames for relevance to the query:
+        
+        """
+        
+        # Add each username with context
+        for i, username in enumerate(usernames[:15]):  # Limit to 15 to avoid token limits
+            context = username.context or "No context available"
+            source = username.source
+            user_prompt += f"{i+1}. @{username.username} (Source: {source})\nContext: {context}\n\n"
+            
+        user_prompt += """Rate each username with a number between 0 and 1, where:
+        - 1.0 = Highly relevant
+        - 0.7 = Moderately relevant
+        - 0.5 = Possibly relevant
+        - 0.2 = Probably not relevant
+        - 0.0 = Definitely not relevant
+        
+        Respond with a JSON object where keys are the numbers and values are the scores:
         {
-            "username": "suggested_username or 'No specific user found'",
-            "confidence": 0.0 to 1.0,
-            "explanation": "Brief explanation of why this user matches or why you couldn't find one"
+          "1": 0.8,
+          "2": 0.3,
+          ...
         }
         """
         
+        # Call GPT-4 for scoring
+        completion = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3
+        )
+        
+        # Parse the response
         try:
-            completion = openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Find a specific TikTok user based on this description: {request.query}"}
-                ],
-                temperature=0.2
-            )
+            content = completion.choices[0].message.content
+            scores = json.loads(content)
+            for i, username in enumerate(usernames[:15]):
+                score_key = str(i+1)
+                if score_key in scores:
+                    username.search_relevance = float(scores[score_key])
+                else:
+                    username.search_relevance = 0.5  # Default if not scored
+        except Exception as e:
+            print(f"Error parsing relevance scores: {type(e).__name__}")
+            # Assign default scores
+            for username in usernames:
+                username.search_relevance = 0.5
+        
+        # For usernames beyond the first 15, give them lower scores
+        for i, username in enumerate(usernames[15:]):
+            username.search_relevance = 0.5
+        
+        return usernames
+        
+    except Exception as e:
+        print(f"Error scoring usernames: {type(e).__name__}")
+        # Fallback: give all usernames medium scores
+        for username in usernames:
+            username.search_relevance = 0.5
+        return usernames
+
+async def analyze_profile_relevance(user_info: Dict, query: str, criteria: List[str]) -> Dict:
+    """
+    Analyze a user profile for relevance to the search query
+    
+    Args:
+        user_info: User information
+        query: Original search query
+        criteria: List of required criteria
+        
+    Returns:
+        Dict with relevance score and explanation
+    """
+    try:
+        # Prepare analysis prompt
+        system_prompt = """You are an expert at analyzing TikTok profiles for relevance to search queries.
+        Your job is to determine if a TikTok profile matches a specific query and required criteria.
+        Provide a relevance score and detailed explanation."""
+        
+        user_prompt = f"""Query: {query}
+        
+        Required criteria:
+        {chr(10).join(['- ' + criterion for criterion in criteria])}
+        
+        TikTok Profile:
+        - Username: @{user_info.get('username', '')}
+        - Display Name: {user_info.get('display_name', '')}
+        - Bio: {user_info.get('bio', '')}
+        - Follower Count: {user_info.get('follower_count', 0)}
+        
+        Analyze this profile and determine:
+        1. How relevant is this profile to the query? (Score 0-1)
+        2. Does it meet the required criteria? Why or why not?
+        3. What evidence in the profile supports your conclusion?
+        
+        Respond with a JSON object:
+        {
+          "relevance_score": 0.9,
+          "explanation": "Detailed explanation here..."
+        }
+        """
+        
+        # Call GPT for analysis
+        completion = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3
+        )
+        
+        try:
+            content = completion.choices[0].message.content
+            result = json.loads(content)
+            return {
+                "relevance_score": float(result.get("relevance_score", 0.5)),
+                "explanation": result.get("explanation", "No explanation provided")
+            }
+        except Exception as parse_error:
+            print(f"Error parsing profile analysis: {type(parse_error).__name__}")
+            # Manually extract data using regex if JSON parsing fails
+            score_match = re.search(r"relevance_score\"?\s*:\s*([0-9.]+)", content)
+            score = float(score_match.group(1)) if score_match else 0.5
             
-            # Parse the JSON response
-            result = json.loads(completion.choices[0].message.content)
+            expl_match = re.search(r"explanation\"?\s*:\s*\"([^\"]+)", content)
+            explanation = expl_match.group(1) if expl_match else "Analysis failed"
             
-            # Format the result according to our model
-            return SmartSearchResult(
-                username=result.get("username", "No specific user found"),
-                confidence=result.get("confidence", 0.0),
-                explanation=result.get("explanation", "No explanation provided")
-            )
-        except Exception as api_error:
-            print(f"OpenAI API error: {str(api_error)}")
-            # Fallback to basic result
-            return SmartSearchResult(
-                username="No specific user found",
-                confidence=0.0,
-                explanation=f"Failed to process your query: {str(api_error)}"
-            )
+            return {
+                "relevance_score": score,
+                "explanation": explanation
+            }
             
     except Exception as e:
-        error_message = f"Error with smart search: {str(e)}"
-        print(f"ERROR in smart_search: {error_message}")
-        print(f"Exception type: {type(e).__name__}")
+        print(f"Error analyzing profile relevance: {type(e).__name__}")
+        return {
+            "relevance_score": 0.5,
+            "explanation": "Error during analysis"
+        }
+
+#-----------------------------------------------------------------------------
+# API Endpoints
+#-----------------------------------------------------------------------------
+
+@app.get("/")
+def read_root():
+    """Root endpoint"""
+    return {"message": "Welcome to TikTok Analyzer API"}
+
+@app.post("/web-enhanced-search")
+async def web_enhanced_search(request: WebEnhancedSearchRequest):
+    """
+    Web-enhanced search for finding TikTok profiles using Tavily search
+    
+    Args:
+        request: Search request parameters
+        
+    Returns:
+        Search response with matched profiles
+    """
+    try:
+        print(f"==== WEB-ENHANCED SEARCH REQUEST ====\nQuery: {request.query}")
+        
+        # Initialize response
+        search_response = WebEnhancedSearchResponse(
+            query=request.query,
+            search_strategy="Tavily Search API + ScrapTik API + GPT-4 Analysis"
+        )
+        
+        # Step 1: Extract search criteria using GPT-4
+        system_prompt = """Analyze this search query for a TikTok user search and extract the specific criteria."""
+        user_prompt = f"""Query: {request.query}
+        
+        Extract specific required criteria as a short list. These should be objective attributes a TikTok user must have to be considered a match. For example: 'must be from Mexico', 'must post about fashion', etc.
+        
+        Return a JSON object with these fields:
+        - required_criteria: an array of strings, each describing one criterion
+        - search_explanation: a detailed explanation of what we're looking for
+        """
+        
+        completion = openai_client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3
+        )
+        
+        criteria_content = completion.choices[0].message.content
+        try:
+            criteria_analysis = json.loads(criteria_content)
+            if criteria_analysis:
+                search_response.required_criteria = criteria_analysis.get("required_criteria", [])
+                search_response.search_strategy += f"\n\nSearching for: {criteria_analysis.get('search_explanation', '')}" 
+        except:
+            # Fallback if JSON parsing fails
+            search_response.required_criteria = ["Relevant to: " + request.query]
+        
+        # Step 2: Use Tavily Search to find TikTok usernames
+        print(f"\n🔍 STARTING TAVILY SEARCH: {request.query}")
+        # Use the smart query optimization in perform_tavily_search
+        tavily_results = perform_tavily_search(request.query, max_results=max(8, request.max_results * 2))
+        search_response.usernames_found = len(tavily_results.get('results', [])) if tavily_results else 0
+        print(f"🔍 Found {search_response.usernames_found} results via Tavily search")
+        
+        # If no usernames found, exit early
+        if not tavily_results or 'results' not in tavily_results or not tavily_results['results']:
+            print("❌ No usernames found via Tavily search, returning empty results")
+            return search_response
+        
+        # Step 3: Fetch and analyze profiles
+        user_matches = []
+        analyzed_count = 0
+        successful_count = 0
+        
+        # Process usernames with higher relevance scores first
+        usernames = []
+        for item in tavily_results['results']:
+            title = item.get('title', '')
+            url = item.get('url', '')
+            content = item.get('content', '')
+            
+            # Combine all content for better extraction
+            full_content = f"{title}\n{content}"
+            
+            # Extract usernames
+            extracted = extract_tiktok_usernames(url, title, full_content)
+            for username in extracted:
+                usernames.append(TikTokUsername(
+                    username=username,
+                    source="Tavily Web Intelligence",
+                    context=f"Found in: {title[:50]}"
+                ))
+        
+        # Score usernames with GPT-4
+        if usernames:
+            usernames = await score_usernames_relevance(usernames, request.query)
+            # Sort by relevance
+            usernames.sort(key=lambda x: x.search_relevance or 0, reverse=True)
+            # Print up to 5 usernames for debugging
+            print(f"Found {len(usernames)} usernames from Tavily results:")
+            for i, u in enumerate(usernames[:5]):
+                print(f"  {i+1}. @{u.username} (Relevance: {u.search_relevance:.2f})")
+        
+        # Limit to prevent too many API calls
+        max_analysis = min(15, request.max_results * 3)
+        
+        for username_obj in usernames:
+            # Limit the number of API calls and stop if we have enough successful results
+            if analyzed_count >= max_analysis or successful_count >= request.max_results:
+                break
+                
+            username = username_obj.username
+            print(f"Analyzing user: @{username}")
+            
+            # Get full user details
+            user_data = await get_user_by_username(username)
+            if not user_data:
+                print(f"Failed to fetch data for @{username}")
+                continue
+                
+            analyzed_count += 1
+            
+            # Extract relevant user information
+            user_info = {
+                "username": username,
+                "display_name": user_data.get("nickname", ""),
+                "bio": user_data.get("signature", ""),
+                "follower_count": user_data.get("follower_count", 0),
+                "profile_pic": get_profile_pic_url(user_data)
+            }
+            
+            print(f"Processing: @{username} ({user_info['display_name']}) - {user_info['follower_count']} followers")
+            
+            # Skip users with no followers or empty bios unless search relevance is high
+            if (int(user_info['follower_count']) < 100 or not user_info['bio'].strip()) and (username_obj.search_relevance or 0) < 0.8:
+                print(f"Skipping @{username} - insufficient followers/bio")
+                continue
+                
+            # Analyze relevance using GPT-4
+            relevance_analysis = await analyze_profile_relevance(
+                user_info, 
+                request.query, 
+                search_response.required_criteria
+            )
+            
+            relevance_score = relevance_analysis.get("relevance_score", 0)
+            explanation = relevance_analysis.get("explanation", "No explanation available")
+            
+            print(f"@{username} relevance score: {relevance_score:.2f}")
+            
+            # Only include profiles that meet the minimum relevance threshold
+            if relevance_score >= request.min_relevance_score:
+                # Get recent videos
+                videos = []
+                if "sec_uid" in user_data:
+                    print(f"Fetching videos for @{username}")
+                    recent_videos = await get_user_videos(user_data["sec_uid"], 3)
+                    for video in recent_videos:
+                        if len(videos) >= 3:
+                            break
+                        desc = video.get("desc", "")
+                        thumbnail = get_video_thumbnail(video)
+                        if desc or thumbnail:
+                            videos.append({
+                                "caption": desc,
+                                "thumbnail": thumbnail
+                            })
+                    print(f"Found {len(videos)} videos for @{username}")
+                
+                # Add to matches - specify Tavily as the discovery method
+                discovery_method = "Tavily Web Search"
+                
+                # Create user match object
+                # Ensure profile_pic is a string, not a dict
+                profile_pic = ""
+                if "profile_pic" in user_info:
+                    if isinstance(user_info["profile_pic"], str):
+                        profile_pic = user_info["profile_pic"]
+                    else:
+                        # Log warning but continue with empty string
+                        print(f"Warning: profile_pic is not a string for @{username}")
+                
+                user_match = WebEnhancedUserMatch(
+                    username=username,
+                    display_name=user_info["display_name"],
+                    bio=user_info["bio"],
+                    follower_count=user_info["follower_count"],
+                    profile_pic=profile_pic,
+                    why_matches=explanation,
+                    relevance_score=relevance_score,
+                    discovery_method=discovery_method,
+                    videos=videos
+                )
+                
+                user_matches.append(user_match)
+                successful_count += 1  # Increment successful match counter
+                print(f"✅ Added @{username} to matches ({successful_count}/{request.max_results})")
+        
+        # Sort matches by relevance score
+        user_matches.sort(key=lambda x: x.relevance_score, reverse=True)
+        
+        # Add matches to response
+        search_response.matches = user_matches[:request.max_results]
+        search_response.profiles_analyzed = analyzed_count
+        print(f"Final results: {len(search_response.matches)} matches from {search_response.profiles_analyzed} analyzed profiles")
+        
+        # If no matches found but we have usernames, create matches directly from usernames with enhanced profile data
+        if not search_response.matches and usernames:
+            print(f"\n💡 Creating comprehensive profile matches from {len(usernames)} usernames")
+            # Take the top usernames by search relevance
+            top_usernames = sorted(usernames, key=lambda x: x.search_relevance or 0, reverse=True)[:request.max_results]
+            
+            print("🔄 Starting enhanced profile data fetch for top usernames")
+            for username_obj in top_usernames:
+                # Use our improved get_user_by_username function which handles multiple APIs and fallbacks
+                user_data = await get_user_by_username(username_obj.username)
+                
+                if user_data:
+                    # If we have any user data (even minimal), create a match
+                    # Make sure profile_pic is always a string
+                    profile_pic_url = get_profile_pic_url(user_data)
+                    
+                    profile_match = WebEnhancedUserMatch(
+                        username=username_obj.username,
+                        display_name=user_data.get("nickname", username_obj.username),
+                        bio=user_data.get("signature", ""),
+                        follower_count=user_data.get("follower_count", 0),
+                        profile_pic=profile_pic_url,
+                        why_matches=f"Found via Tavily Search for '{request.query}'",
+                        relevance_score=username_obj.search_relevance or 0.8,
+                        discovery_method="Tavily Web Search" if user_data.get("follower_count", 0) > 0 else "Tavily Web Search (Limited Data)"
+                    )
+                    
+                    # If user has an ID, try to get videos too
+                    if user_data.get("uid"):
+                        try:
+                            videos = await get_user_videos(user_data["uid"], count=3)
+                            if videos:
+                                # Process videos
+                                profile_match.videos = []
+                                for video in videos[:3]:
+                                    # Get thumbnail with better error handling
+                                    thumbnail = get_video_thumbnail(video)
+                                    profile_match.videos.append({
+                                        "id": video.get("aweme_id", ""),
+                                        "desc": video.get("desc", "No description"),
+                                        "create_time": video.get("create_time", 0),
+                                        "thumbnail": thumbnail
+                                    })
+                                print(f"🎥 Added {len(profile_match.videos)} videos for @{username_obj.username}")
+                        except Exception as video_err:
+                            print(f"Error fetching videos: {str(video_err)}")
+                    
+                    # Add relevance explanation using GPT-4
+                    try:
+                        if search_response.required_criteria:
+                            # Create content for GPT-4 analysis
+                            content_for_analysis = f"TikTok User: @{username_obj.username}\n"
+                            content_for_analysis += f"Display Name: {profile_match.display_name}\n"
+                            content_for_analysis += f"Bio: {profile_match.bio}\n"
+                            content_for_analysis += f"Follower Count: {profile_match.follower_count}\n"
+                            
+                            # Add video content if available
+                            if hasattr(profile_match, 'videos') and profile_match.videos:
+                                content_for_analysis += "\nRecent Videos:\n"
+                                for i, video in enumerate(profile_match.videos):
+                                    content_for_analysis += f"Video {i+1}: {video.get('desc', '')}\n"
+                            
+                            # GPT-4 analysis
+                            relevance_prompt = f"""You are analyzing the relevance of a TikTok profile for the search: '{request.query}'.
+                            
+                            Search Criteria: {', '.join(search_response.required_criteria)}
+                            
+                            Profile Information:
+                            {content_for_analysis}
+                            
+                            Explain in 1-2 sentences why this profile is relevant to the search query. If it's not clearly relevant, explain why it might be a partial match.
+                            """
+                            
+                            explanation = await get_gpt_completion(relevance_prompt, max_tokens=150)
+                            if explanation and explanation.strip():
+                                profile_match.why_matches = explanation.strip()
+                                print(f"💬 Added relevance explanation for @{username_obj.username}")
+                    except Exception as gpt_err:
+                        print(f"Error getting relevance explanation: {str(gpt_err)}")
+                    
+                    search_response.matches.append(profile_match)
+                    print(f"✅ Added enhanced profile match for @{username_obj.username}")
+                else:
+                    # This should rarely happen since get_user_by_username now returns minimal data in worst case
+                    simple_match = WebEnhancedUserMatch(
+                        username=username_obj.username,
+                        display_name=username_obj.username,
+                        bio="Profile information not available",
+                        follower_count=0,
+                        profile_pic="",
+                        why_matches=f"Found via Tavily Search for '{request.query}'",
+                        relevance_score=username_obj.search_relevance or 0.7,
+                        discovery_method="Tavily Web Search (Direct Match)"
+                    )
+                    search_response.matches.append(simple_match)
+                    print(f"➕ Added simple match for @{username_obj.username}")
+            
+            # Mark that we did profile analysis
+            search_response.profiles_analyzed = len(search_response.matches)
+            print(f"✅ Added {len(search_response.matches)} enhanced profile matches in total")
+        
+        return search_response
+    
+    except Exception as e:
+        print(f"Error in web-enhanced search: {str(e)}")
         import traceback
         print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=error_message)
+        raise HTTPException(status_code=500, detail=f"Web-enhanced search failed: {str(e)}")
 
-# Run with: uvicorn main:app --reload
+#-----------------------------------------------------------------------------
+# Basic REST Endpoints for backward compatibility
+#-----------------------------------------------------------------------------
+
+class UserInfo(BaseModel):
+    """Basic user info model"""
+    username: str
+
+@app.get("/user/{username}")
+async def get_user(username: str):
+    """
+    Get user info by username
+    
+    Args:
+        username: TikTok username
+        
+    Returns:
+        User data
+    """
+    user_data = await get_user_by_username(username)
+    if not user_data:
+        raise HTTPException(status_code=404, detail=f"User @{username} not found")
+    return user_data
+
+#-----------------------------------------------------------------------------
+# Additional Frontend Compatibility Endpoints
+#-----------------------------------------------------------------------------
+
+class UserCriteria(BaseModel):
+    """User search criteria model"""
+    min_followers: Optional[int] = None
+    max_followers: Optional[int] = None
+    min_following: Optional[int] = None
+    max_following: Optional[int] = None
+    min_likes: Optional[int] = None
+    max_likes: Optional[int] = None
+    verified: Optional[bool] = None
+
+class SearchUsersRequest(BaseModel):
+    """Search users request model"""
+    query: str
+    criteria: Optional[UserCriteria] = None
+    count: int = 20
+    deep_analysis: bool = False
+
+@app.post("/search-users")
+async def search_users(request: SearchUsersRequest):
+    """
+    Search for TikTok users based on query and criteria
+    
+    Args:
+        request: Search request with query and criteria
+        
+    Returns:
+        List of matching TikTok users
+    """
+    try:
+        print(f"Searching for TikTok users: '{request.query}'")
+        
+        # Use Tavily search first for better discovery
+        print("🔍 USING TAVILY FIRST for better web discovery")
+        # We'll let the perform_tavily_search function create an optimized query
+        tavily_results = perform_tavily_search(request.query, request.count)
+        
+        # Extract usernames from Tavily results
+        extracted_usernames = []
+        
+        if tavily_results and "results" in tavily_results:
+            print(f"✅ Found {len(tavily_results['results'])} Tavily search results")
+            
+            # Analyze each search result to extract usernames
+            for result in tavily_results["results"]:
+                url = result.get("url", "")
+                title = result.get("title", "")
+                content = result.get("content", "")
+                
+                # Extract usernames from this result
+                result_usernames = extract_tiktok_usernames(url, title, content)
+                
+                for username in result_usernames:
+                    extracted_usernames.append(TikTokUsername(
+                        username=username,
+                        source="Tavily Web Intelligence",
+                        context=f"{title}: {content[:100]}..."
+                    ))
+            
+            # Debug output
+            if extracted_usernames:
+                print(f"✅ Extracted {len(extracted_usernames)} usernames from Tavily results:")
+                for i, u in enumerate(extracted_usernames[:5]):
+                    print(f"  {i+1}. @{u.username} (Source: {u.source})")
+            else:
+                print("⚠️ No usernames extracted from Tavily results, falling back to direct TikTok search")
+                
+        # Fall back to direct TikTok search for additional usernames
+        tiktok_usernames = await search_directly_on_tiktok(request.query, request.count)
+        
+        # Combine usernames from both sources with deduplication
+        all_usernames = []
+        seen_usernames = set()
+        
+        # First add Tavily usernames (higher priority since they come from web intelligence)
+        for username in extracted_usernames:
+            if username.username.lower() not in seen_usernames and len(all_usernames) < request.count:
+                all_usernames.append(username)
+                seen_usernames.add(username.username.lower())
+        
+        # Then add TikTok search usernames
+        for username in tiktok_usernames:
+            if username.username.lower() not in seen_usernames and len(all_usernames) < request.count:
+                all_usernames.append(username)
+                seen_usernames.add(username.username.lower())
+        
+        print(f"🔍 TOTAL USERNAMES FOUND: {len(all_usernames)}")
+        if not all_usernames:
+            print(f"No usernames found for query: '{request.query}'")
+            return []
+            
+        # Process and enrich each user
+        users = []
+        for username_obj in all_usernames[:request.count]:
+            try:
+                # Get user info using our robust multi-endpoint approach
+                user_data = await get_user_by_username(username_obj.username)
+                
+                if not user_data:
+                    continue
+                    
+                # Check if user meets criteria
+                if request.criteria:
+                    criteria = request.criteria
+                    # Check follower count criteria
+                    if criteria.min_followers and user_data.get("follower_count", 0) < criteria.min_followers:
+                        continue
+                    if criteria.max_followers and user_data.get("follower_count", 0) > criteria.max_followers:
+                        continue
+                        
+                    # Check following count criteria
+                    if criteria.min_following and user_data.get("following_count", 0) < criteria.min_following:
+                        continue
+                    if criteria.max_following and user_data.get("following_count", 0) > criteria.max_following:
+                        continue
+                        
+                    # Check likes count criteria
+                    if criteria.min_likes and user_data.get("likes_count", 0) < criteria.min_likes:
+                        continue
+                    if criteria.max_likes and user_data.get("likes_count", 0) > criteria.max_likes:
+                        continue
+                        
+                    # Check verified status
+                    if criteria.verified is not None and user_data.get("verified", False) != criteria.verified:
+                        continue
+                
+                # Create user object
+                user = {
+                    "id": user_data.get("uid", "") or user_data.get("sec_uid", ""),
+                    "username": username_obj.username,
+                    "display_name": user_data.get("nickname", username_obj.username),
+                    "bio": user_data.get("signature", ""),
+                    "follower_count": user_data.get("follower_count", 0),
+                    "following_count": user_data.get("following_count", 0),
+                    "likes_count": user_data.get("likes_count", 0),
+                    "verified": user_data.get("verified", False),
+                    "profile_pic": get_profile_pic_url(user_data)
+                }
+                
+                # Add relevance analysis if deep_analysis is requested
+                if request.deep_analysis and openai_client:
+                    try:
+                        # Extract criteria from the query
+                        system_prompt = """Extract search criteria from the query. 
+                        Return a list of specific requirements that a TikTok account should meet to be relevant."""
+                        
+                        user_prompt = f"Query: {request.query}\n\nWhat criteria should a TikTok account meet to be relevant to this query?"
+                        
+                        completion = openai_client.chat.completions.create(
+                            model="gpt-4",
+                            messages=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt}
+                            ],
+                            temperature=0.3
+                        )
+                        
+                        criteria_text = completion.choices[0].message.content
+                        criteria_list = [c.strip() for c in criteria_text.split('\n') if c.strip()]
+                        
+                        # Analyze profile relevance
+                        relevance_analysis = await analyze_profile_relevance(
+                            {
+                                "username": user["username"],
+                                "display_name": user["display_name"],
+                                "bio": user["bio"],
+                                "follower_count": user["follower_count"]
+                            },
+                            request.query,
+                            criteria_list
+                        )
+                        
+                        # Add analysis to user object
+                        user["analysis_result"] = {
+                            "score": relevance_analysis.get("relevance_score", 0.5),
+                            "explanation": relevance_analysis.get("explanation", "No explanation available")
+                        }
+                    except Exception as analysis_err:
+                        print(f"Error in relevance analysis: {str(analysis_err)}")
+                        user["analysis_result"] = {
+                            "score": 0.5,
+                            "explanation": "Analysis failed due to an error"
+                        }
+                
+                # Add user to results
+                users.append(user)
+                print(f"✅ Added user @{username_obj.username} to results")
+                
+            except Exception as user_err:
+                print(f"Error processing user @{username_obj.username}: {str(user_err)}")
+                continue
+        
+        # Check if query mentions a specific location
+        location_keywords = ["from", "in", "located in", "based in"]
+        location_search = False
+        query_lower = request.query.lower()
+        
+        for keyword in location_keywords:
+            if keyword in query_lower:
+                location_search = True
+                print(f"Location-based search detected with keyword: {keyword}")
+                break
+                
+        # Sort users with smarter location relevance
+        if location_search:
+            # Extract possible location from query
+            location_parts = query_lower.split(" from ")  # Most common pattern "X from Y"
+            target_location = ""
+            
+            if len(location_parts) > 1:
+                target_location = location_parts[1].strip().split()[0]  # First word after "from"
+                print(f"Target location detected: {target_location}")
+                
+            # Custom sort function that prioritizes username+bio location match, then relevance/followers
+            def location_relevance_sort(user):
+                username = user.get("username", "").lower()
+                display_name = user.get("display_name", "").lower()
+                bio = user.get("bio", "").lower()
+                
+                # Calculate a location match score
+                location_score = 0
+                if target_location:  # If we have a specific location target
+                    if target_location in username or target_location in display_name:
+                        location_score += 10  # Highest priority for username/display_name match
+                    if target_location in bio:
+                        location_score += 5   # Good priority for bio match
+                
+                # Get follower score (0-1 scale)
+                follower_count = user.get("follower_count", 0)
+                follower_score = min(follower_count / 1000000, 1)  # Cap at 1M followers for scoring
+                
+                # Combine scores - location is primary, followers secondary
+                return (location_score, follower_score)
+                
+            # Sort by location relevance first, then by followers    
+            users.sort(key=location_relevance_sort, reverse=True)
+            print(f"Sorted results by location relevance for '{target_location}'")
+        elif request.deep_analysis:
+            # If deep analysis but not location-specific, sort by analysis score
+            users.sort(key=lambda u: u.get("analysis_result", {}).get("score", 0), reverse=True)
+        else:
+            # Default sort by followers
+            users.sort(key=lambda u: u.get("follower_count", 0), reverse=True)
+        
+        # Filter results if criteria specified
+        if request.criteria:
+            # Determine if request is about security/privacy
+            if request.query and ('privacy' in request.query.lower() or 'security' in request.query.lower() or 'cybersecurity' in request.query.lower()):
+                print("🔐 Security/privacy query detected - applying special filtering")
+                # Apply strict filtering for privacy/security influencers
+                keyword = request.query.lower()
+                
+                # First, compute the relevance score for all users
+                for user in users:
+                    # Add a relevance score to each user
+                    user['security_relevance'] = security_privacy_relevance_score(user)
+                
+                # Filter by minimum score threshold (removes totally irrelevant results)
+                minimum_threshold = 0.2  # Minimum relevance score to be included
+                filtered_users = [u for u in users if u.get('security_relevance', 0) >= minimum_threshold]
+                
+                # If we have enough quality results, use only those that pass security check
+                quality_users = [u for u in filtered_users if is_security_privacy_focused(u)]
+                
+                # Use quality results if we have enough, otherwise fall back to filtered
+                if len(quality_users) >= 3:
+                    users = quality_users
+                    print(f"✅ Found {len(quality_users)} quality security/privacy influencers")
+                elif len(filtered_users) >= 3:
+                    users = filtered_users
+                    print(f"⚠️ Using {len(filtered_users)} filtered results - couldn't find enough top-quality security influencers")
+                # If all else fails, keep original results but still sort by relevance
+                
+                # Apply final sorting, prioritizing relevance score but also considering followers
+                users.sort(key=lambda u: (-u.get('security_relevance', 0), -int(u.get('follower_count', 0))))
+            elif location_search:  # Handle location-based queries (already sorted above)
+                pass  # Already handled by location_relevance_sort above
+            else:
+                # Sort by follower count as default
+                users.sort(key=lambda u: -int(u.get('follower_count', 0)))
+            
+        else:
+            # Default sort by follower count 
+            users.sort(key=lambda u: -int(u.get('follower_count', 0)))
+        
+        return users
+            
+    except Exception as e:
+        print(f"Error in search_users: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+#-----------------------------------------------------------------------------
+# Application Entry Point
+#-----------------------------------------------------------------------------
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
